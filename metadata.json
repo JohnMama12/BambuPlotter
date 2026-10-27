@@ -1,0 +1,6 @@
+{
+  "name": "Bambu Plotter Studio",
+  "description": "Precision 2D pen plotting software for Bambu Lab A1 and A1 Mini 3D printers with offset calibration, paper mapping, and multi-color vector printing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
