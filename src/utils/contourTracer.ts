@@ -240,14 +240,17 @@ export function generatePolygonInfill(
   penDiameter: number,
   pattern: InfillPattern,
   penId: string,
-  angleDeg: number = 45
+  angleDeg: number = 45,
+  customSpacing?: number
 ): PathSegment[] {
   if (pattern === 'outline' || contours.length === 0) {
     return [];
   }
 
   const result: PathSegment[] = [];
-  const spacing = Math.max(0.3, penDiameter * 1.15);
+  const spacing = customSpacing !== undefined && customSpacing > 0
+    ? Math.max(0.2, customSpacing)
+    : Math.max(0.3, penDiameter * 1.15);
 
   // Compute bounding box
   let minX = Infinity;
@@ -266,7 +269,14 @@ export function generatePolygonInfill(
 
   if (maxX <= minX || maxY <= minY) return [];
 
-  if (pattern === 'monotonic' || pattern === 'rectilinear' || pattern === 'grid') {
+  const isHatchPattern =
+    pattern === 'parallel_hatch' ||
+    pattern === 'crosshatch' ||
+    pattern === 'monotonic' ||
+    pattern === 'rectilinear' ||
+    pattern === 'grid';
+
+  if (isHatchPattern) {
     const sweepLines = (angle: number, isAlternating: boolean): PathSegment[] => {
       const rad = (angle * Math.PI) / 180;
       const cosA = Math.cos(rad);
@@ -354,11 +364,11 @@ export function generatePolygonInfill(
       return segments;
     };
 
-    if (pattern === 'monotonic') {
+    if (pattern === 'parallel_hatch' || pattern === 'monotonic') {
       result.push(...sweepLines(angleDeg, false));
     } else if (pattern === 'rectilinear') {
       result.push(...sweepLines(angleDeg, true));
-    } else if (pattern === 'grid') {
+    } else if (pattern === 'crosshatch' || pattern === 'grid') {
       result.push(...sweepLines(angleDeg, false));
       result.push(...sweepLines(angleDeg + 90, false));
     }

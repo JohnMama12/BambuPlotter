@@ -50,7 +50,7 @@ export const ConnectionModal: React.FC<ConnectionModalProps> = ({
 
   // Bridge / ngrok credentials
   const [bridgeUrl, setBridgeUrl] = useState<string>(
-    () => localStorage.getItem('bambu_bridge_url') || '2579-69-49-59-238.ngrok-free.app'
+    () => localStorage.getItem('bambu_bridge_url') || ''
   );
   const [bridgePort, setBridgePort] = useState<string>(
     () => localStorage.getItem('bambu_bridge_port') || '443'
@@ -62,12 +62,12 @@ export const ConnectionModal: React.FC<ConnectionModalProps> = ({
     () => localStorage.getItem('bambu_bridge_pass') || ''
   );
   const [serial, setSerial] = useState<string>(
-    () => localStorage.getItem('bambu_serial') || '0300CA662401354'
+    () => localStorage.getItem('bambu_serial') || ''
   );
 
   // Direct LAN credentials
   const [directIp, setDirectIp] = useState<string>(
-    () => localStorage.getItem('bambu_direct_ip') || '192.168.1.150'
+    () => localStorage.getItem('bambu_direct_ip') || ''
   );
   const [directCode, setDirectCode] = useState<string>(
     () => localStorage.getItem('bambu_direct_code') || ''

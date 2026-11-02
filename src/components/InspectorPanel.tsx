@@ -562,41 +562,175 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
               </div>
             )}
 
-            {/* 3D Print First-Layer Infill Pattern (Applies to ALL vector objects including text) */}
-            <div className="p-3 rounded-lg bg-[#0d1017] border border-[#222b3a] space-y-2">
+            {/* Plotter Vector Fill & Hatching Engine */}
+            <div className="p-3 rounded-lg bg-[#0d1017] border border-[#222b3a] space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300 block">
-                  3D Print Infill Pattern
+                  Vector Fill & Hatching
                 </span>
-                <span className="text-[10px] font-mono text-emerald-400">First Layer Style</span>
+                <span className="text-[10px] font-mono text-emerald-400">Plotter Engine</span>
               </div>
+
+              {/* 4 Primary Plotter Patterns */}
               <div className="grid grid-cols-2 gap-1.5 text-xs">
                 {[
-                  { id: 'monotonic', label: 'Monotonic', desc: 'Tip-to-tip 45° sweep (Default)' },
-                  { id: 'concentric', label: 'Concentric', desc: 'Nested inward rings' },
-                  { id: 'rectilinear', label: 'Rectilinear', desc: 'Alternating zigzag' },
-                  { id: 'grid', label: 'Grid Matrix', desc: 'Orthogonal 90° cross' },
-                  { id: 'outline', label: 'Outline Only', desc: 'Boundary loop only' },
-                ].map((pattern) => (
-                  <button
-                    key={pattern.id}
-                    onClick={() =>
-                      onUpdateElement({
-                        ...selectedElement,
-                        fillStyle: pattern.id as InfillPattern,
-                      })
-                    }
-                    className={`p-2 rounded-lg text-left border transition-all ${
-                      (selectedElement.fillStyle || 'monotonic') === pattern.id
-                        ? 'bg-emerald-950/50 border-emerald-500 text-emerald-300 font-bold'
-                        : 'bg-[#121620] border-[#222b3a] text-slate-400 hover:border-slate-600'
-                    }`}
-                  >
-                    <div className="text-[11px]">{pattern.label}</div>
-                    <div className="text-[9px] text-slate-500">{pattern.desc}</div>
-                  </button>
-                ))}
+                  {
+                    id: 'outline',
+                    label: 'Contour Outline',
+                    desc: 'Outer vector border only',
+                  },
+                  {
+                    id: 'parallel_hatch',
+                    label: 'Parallel Hatch',
+                    desc: 'Linear unidirectional sweep',
+                  },
+                  {
+                    id: 'crosshatch',
+                    label: 'Crosshatch Matrix',
+                    desc: 'Dual orthogonal 90° hatch',
+                  },
+                  {
+                    id: 'concentric',
+                    label: 'Concentric Loops',
+                    desc: 'Nested inward offset loops',
+                  },
+                ].map((pattern) => {
+                  const currentPattern = selectedElement.fillStyle || 'outline';
+                  const isSelected =
+                    currentPattern === pattern.id ||
+                    (pattern.id === 'parallel_hatch' &&
+                      (currentPattern === 'monotonic' || currentPattern === 'rectilinear')) ||
+                    (pattern.id === 'crosshatch' && currentPattern === 'grid');
+
+                  return (
+                    <button
+                      key={pattern.id}
+                      onClick={() =>
+                        onUpdateElement({
+                          ...selectedElement,
+                          fillStyle: pattern.id as InfillPattern,
+                        })
+                      }
+                      className={`p-2 rounded-lg text-left border transition-all ${
+                        isSelected
+                          ? 'bg-emerald-950/50 border-emerald-500 text-emerald-300 font-bold'
+                          : 'bg-[#121620] border-[#222b3a] text-slate-400 hover:border-slate-600'
+                      }`}
+                    >
+                      <div className="text-[11px]">{pattern.label}</div>
+                      <div className="text-[9px] text-slate-500 leading-snug">{pattern.desc}</div>
+                    </button>
+                  );
+                })}
               </div>
+
+              {/* Hatch Angle & Spacing Controls (Active when Parallel Hatch or Crosshatch is selected) */}
+              {(selectedElement.fillStyle === 'parallel_hatch' ||
+                selectedElement.fillStyle === 'crosshatch' ||
+                selectedElement.fillStyle === 'monotonic' ||
+                selectedElement.fillStyle === 'rectilinear' ||
+                selectedElement.fillStyle === 'grid') && (
+                <div className="pt-2 border-t border-[#1e2536] space-y-2.5">
+                  {/* Hatch Angle Slider & Quick Presets */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] text-slate-300 font-mono">
+                        HATCH ANGLE: {selectedElement.hatchAngle ?? 45}°
+                      </label>
+                      <div className="flex items-center gap-1">
+                        {[0, 45, 90, 135].map((deg) => (
+                          <button
+                            key={deg}
+                            onClick={() =>
+                              onUpdateElement({
+                                ...selectedElement,
+                                hatchAngle: deg,
+                              })
+                            }
+                            className={`px-1.5 py-0.5 rounded text-[9px] font-mono border transition-colors ${
+                              (selectedElement.hatchAngle ?? 45) === deg
+                                ? 'bg-emerald-800 text-white border-emerald-500'
+                                : 'bg-[#161c28] text-slate-400 border-[#263145] hover:text-white'
+                            }`}
+                          >
+                            {deg}°
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="180"
+                      step="5"
+                      value={selectedElement.hatchAngle ?? 45}
+                      onChange={(e) =>
+                        onUpdateElement({
+                          ...selectedElement,
+                          hatchAngle: parseInt(e.target.value, 10),
+                        })
+                      }
+                      className="w-full accent-emerald-400 cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Line Spacing / Density (mm) */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[10px] text-slate-300 font-mono">
+                        LINE SPACING (mm)
+                      </label>
+                      <span className="text-[9px] text-slate-500 font-mono">
+                        {(selectedElement.hatchSpacingMm ?? 0.8) <= 0.5
+                          ? 'Dense shading'
+                          : (selectedElement.hatchSpacingMm ?? 0.8) <= 1.2
+                          ? 'Standard hatch'
+                          : 'Open sketch'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="0.2"
+                        max="6.0"
+                        step="0.1"
+                        value={selectedElement.hatchSpacingMm ?? 0.8}
+                        onChange={(e) =>
+                          onUpdateElement({
+                            ...selectedElement,
+                            hatchSpacingMm: Math.max(0.2, parseFloat(e.target.value) || 0.8),
+                          })
+                        }
+                        className="w-20 bg-[#141924] border border-[#263145] text-white px-2 py-1 rounded text-xs font-mono"
+                      />
+                      <div className="flex-1 flex gap-1">
+                        {[
+                          { label: '0.4mm (Dense)', val: 0.4 },
+                          { label: '0.8mm (Std)', val: 0.8 },
+                          { label: '1.5mm (Open)', val: 1.5 },
+                        ].map((preset) => (
+                          <button
+                            key={preset.val}
+                            onClick={() =>
+                              onUpdateElement({
+                                ...selectedElement,
+                                hatchSpacingMm: preset.val,
+                              })
+                            }
+                            className={`flex-1 py-1 rounded text-[9px] font-mono border transition-colors truncate ${
+                              (selectedElement.hatchSpacingMm ?? 0.8) === preset.val
+                                ? 'bg-emerald-950/60 border-emerald-500/60 text-emerald-300'
+                                : 'bg-[#141924] border-[#222b3a] text-slate-400 hover:border-slate-500'
+                            }`}
+                          >
+                            {preset.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Vector Precision & Resolution Slider */}

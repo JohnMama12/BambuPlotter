@@ -99,16 +99,21 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
   useEffect(() => {
     if (containerRef.current) {
       const { clientWidth, clientHeight } = containerRef.current;
-      const initialZoom = Math.min(
-        (clientWidth - 100) / spec.width,
-        (clientHeight - 100) / spec.depth,
-        2.5
-      );
-      setZoom(initialZoom);
-      setPan({
-        x: (clientWidth - spec.width * initialZoom) / 2,
-        y: (clientHeight - spec.depth * initialZoom) / 2,
-      });
+      if (clientWidth > 100 && clientHeight > 100) {
+        const initialZoom = Math.max(
+          0.8,
+          Math.min(
+            (clientWidth - 80) / spec.width,
+            (clientHeight - 80) / spec.depth,
+            2.5
+          )
+        );
+        setZoom(initialZoom);
+        setPan({
+          x: Math.round((clientWidth - spec.width * initialZoom) / 2),
+          y: Math.round((clientHeight - spec.depth * initialZoom) / 2),
+        });
+      }
     }
   }, [printerModel, spec.width, spec.depth]);
 
@@ -126,9 +131,20 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
 
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
     const zoomFactor = e.deltaY < 0 ? 1.12 : 0.88;
     const newZoom = Math.max(0.5, Math.min(8.0, zoom * zoomFactor));
+
+    // Keep point under cursor fixed during zoom
+    const newPanX = mouseX - (mouseX - pan.x) * (newZoom / zoom);
+    const newPanY = mouseY - (mouseY - pan.y) * (newZoom / zoom);
+
     setZoom(newZoom);
+    setPan({ x: newPanX, y: newPanY });
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -241,6 +257,8 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
           rotation: 0,
           scale: 1,
           fillStyle: 'outline',
+          hatchAngle: 45,
+          hatchSpacingMm: 0.8,
         };
       } else if (activeTool === 'rect') {
         newElem = {
@@ -255,6 +273,8 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
           rotation: 0,
           scale: 1,
           fillStyle: 'outline',
+          hatchAngle: 45,
+          hatchSpacingMm: 0.8,
         };
       } else if (activeTool === 'line') {
         newElem = {
@@ -302,16 +322,21 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
   const handleResetView = () => {
     if (containerRef.current) {
       const { clientWidth, clientHeight } = containerRef.current;
-      const fitZoom = Math.min(
-        (clientWidth - 100) / spec.width,
-        (clientHeight - 100) / spec.depth,
-        2.5
-      );
-      setZoom(fitZoom);
-      setPan({
-        x: (clientWidth - spec.width * fitZoom) / 2,
-        y: (clientHeight - spec.depth * fitZoom) / 2,
-      });
+      if (clientWidth > 100 && clientHeight > 100) {
+        const fitZoom = Math.max(
+          0.8,
+          Math.min(
+            (clientWidth - 80) / spec.width,
+            (clientHeight - 80) / spec.depth,
+            2.5
+          )
+        );
+        setZoom(fitZoom);
+        setPan({
+          x: Math.round((clientWidth - spec.width * fitZoom) / 2),
+          y: Math.round((clientHeight - spec.depth * fitZoom) / 2),
+        });
+      }
     }
   };
 
@@ -391,6 +416,8 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
       {/* Main Coordinate Surface */}
       <div
         style={{
+          left: 0,
+          top: 0,
           transform: `translate(${pan.x}px, ${pan.y}px)`,
           width: `${spec.width * zoom}px`,
           height: `${spec.depth * zoom}px`,
@@ -569,9 +596,10 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
             </div>
           )}
 
-          {/* Interactive Canvas Element Selection Bounding Boxes */}
+          {/* Interactive Canvas Element Visuals & Selection Bounding Boxes */}
           {elements.map((elem) => {
             const isSelected = elem.id === selectedElementId;
+            const elemPen = pens.find((p) => p.id === elem.penId) || pens[0];
 
             return (
               <div
@@ -591,9 +619,60 @@ export const PlotterCanvas: React.FC<PlotterCanvasProps> = ({
                     : 'hover:ring-1 hover:ring-slate-400'
                 }`}
               >
-                {/* Clean bounding tag */}
+                {/* Element Vector Visual representation */}
+                {elem.type === 'circle' && (
+                  <div
+                    className="w-full h-full rounded-full border-2 pointer-events-none opacity-85"
+                    style={{ borderColor: elemPen.hex }}
+                  />
+                )}
+
+                {elem.type === 'rect' && (
+                  <div
+                    className="w-full h-full border-2 pointer-events-none opacity-85"
+                    style={{ borderColor: elemPen.hex }}
+                  />
+                )}
+
+                {elem.type === 'text' && (
+                  <div
+                    className="w-full h-full flex items-start justify-start pointer-events-none select-none font-semibold whitespace-pre overflow-hidden"
+                    style={{
+                      fontFamily: elem.fontFamily || 'Arial',
+                      fontSize: `${Math.max(8, (elem.fontSize || 10) * zoom * 0.9)}px`,
+                      color: elemPen.hex,
+                      fontWeight: elem.isBold ? 'bold' : 'normal',
+                      fontStyle: elem.isItalic ? 'italic' : 'normal',
+                      textDecoration: elem.isUnderline ? 'underline' : 'none',
+                      lineHeight: elem.lineHeight || 1.35,
+                    }}
+                  >
+                    {elem.textContent}
+                  </div>
+                )}
+
+                {elem.type === 'line' && (
+                  <svg className="w-full h-full pointer-events-none overflow-visible">
+                    <line
+                      x1={0}
+                      y1={elem.height * zoom}
+                      x2={elem.width * zoom}
+                      y2={0}
+                      stroke={elemPen.hex}
+                      strokeWidth={Math.max(1.5, elemPen.diameter * zoom)}
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                )}
+
+                {/* Clean bounding tag - smart clamped so it never clips off the bed edge */}
                 {isSelected && (
-                  <div className="absolute -top-5 left-0 bg-emerald-700 text-white text-[9px] font-mono px-1.5 py-0.5 rounded-t whitespace-nowrap shadow-xs">
+                  <div
+                    className="absolute -top-5 bg-emerald-700 text-white text-[9px] font-mono px-1.5 py-0.5 rounded-t whitespace-nowrap shadow-xs pointer-events-none"
+                    style={{
+                      left: Math.max(0, -elem.x * zoom),
+                    }}
+                  >
                     {elem.name} ({elem.x.toFixed(1)}, {elem.y.toFixed(1)}mm)
                   </div>
                 )}

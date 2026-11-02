@@ -27,6 +27,7 @@ function findUnsafeZMove(gcode: string): { z: number; line: string } | null {
   const lines = String(gcode || '').split(/\r?\n/);
   for (const rawLine of lines) {
     const line = rawLine.trim();
+    if (/^\s*(G28|G29|G92)/i.test(line)) continue;
     if (!/^G0?[0-3](\s|$)/i.test(line)) continue;
     const zMatches = [...line.matchAll(/[Zz]\s*(-?\d*\.?\d+(?:[eE][-+]?\d+)?)/g)];
     for (const match of zMatches) {
@@ -627,7 +628,7 @@ app.post('/api/bambu/command', (req: Request, res: Response) => {
       print: {
         sequence_id: sequence_id || String(Date.now()),
         command: 'gcode_line',
-        param: gcode,
+        param: String(gcode).endsWith('\n') ? String(gcode) : `${gcode}\n`,
       },
     };
   } else if (command) {

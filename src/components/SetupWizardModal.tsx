@@ -10,7 +10,11 @@ import {
   RotateCcw,
   Sparkles,
   HelpCircle,
-  AlertCircle
+  AlertTriangle,
+  Move,
+  Play,
+  ShieldCheck,
+  Sliders
 } from 'lucide-react';
 import {
   PaperBounds,
@@ -24,10 +28,8 @@ import { bambuMachine } from '../services/bambuService';
 import {
   Z_SAFETY,
   clampPenRelease,
-  getBedReference,
   getDrawZ,
   getTravelZ,
-  normalizeZCalibration,
 } from '../utils/zSafety';
 
 interface SetupWizardModalProps {
@@ -56,21 +58,12 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   currentPenPos,
 }) => {
   const [step, setStep] = useState<number>(1);
-  const [retractionLiftVal, setRetractionLiftVal] = useState<number>(
-    clampPenRelease(zCalibration.penReleaseMm)
+  const [travelLiftVal, setTravelLiftVal] = useState<number>(
+    clampPenRelease(zCalibration.penReleaseMm) || 3.5
   );
   const [jogStep, setJogStep] = useState<number>(10);
-
-  const handleRefreshPosition = () => {
-    const telemetry = bambuMachine.getTelemetry();
-    if (!telemetry.isConnected || telemetry.connectionMode !== 'mqtt') {
-      alert('Printer not connected via MQTT.');
-      return;
-    }
-    // Send a dummy move to current position to force a position report
-    const pos = telemetry.hotendPos;
-    bambuMachine.sendRawGcode(`G0 X${pos.x.toFixed(3)} Y${pos.y.toFixed(3)} Z${pos.z.toFixed(3)}`);
-  };
+  const [actionStatus, setActionStatus] = useState<{ type: 'info' | 'success' | 'error'; message: string } | null>(null);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
 
   // 4 corners mapping state
   const [tl, setTl] = useState<Point2D | null>(paperBounds.isCalibrated ? paperBounds.topLeft : null);
@@ -81,65 +74,120 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   if (!isOpen) return null;
 
   const spec = PRINTER_SPECS[printerModel];
-  const bedRef = getBedReference(zCalibration);
-  const previewDrawZ = getDrawZ(zCalibration);
-  const previewTravelZ = getTravelZ({ ...zCalibration, penReleaseMm: retractionLiftVal });
-  const zReady = zCalibration.datumSource === 'bed_stop' && zCalibration.isCalibrated;
+  const telemetry = bambuMachine.getTelemetry();
+  const isMqtt = telemetry.isConnected && telemetry.connectionMode === 'mqtt';
 
-  const handleHomeAll = () => {
-    const telemetry = bambuMachine.getTelemetry();
-    if (!telemetry.isConnected || telemetry.connectionMode !== 'mqtt') {
-      alert('Printer not connected! Please open "Bambu Printer Link" and click "Verify & Connect" first.');
-      return;
-    }
-    const ok = window.confirm(
-      'Homing (G28) makes the nozzle touch the bed.\n\nRemove the pen first or it may be crushed / dislodged.\n\nContinue?'
-    );
-    if (!ok) return;
-    bambuMachine.homeAll();
-  };
-
-  const handleCaptureBedReference = () => {
-    const result = bambuMachine.captureBedReference();
-    if (!result.success) {
-      alert(result.error || 'Could not capture the bed reference.');
+  const showStatus = (type: 'info' | 'success' | 'error', message: string) => {
+    setActionStatus({ type, message });
+    if (type === 'success' || type === 'info') {
+      setTimeout(() => setActionStatus(null), 4000);
     }
   };
 
-  const handleFineAdjustZ = async (deltaMm: number) => {
-    const telemetry = bambuMachine.getTelemetry();
-    if (!telemetry.isConnected || telemetry.connectionMode !== 'mqtt') {
-      alert('Printer not connected via MQTT.');
-      return;
-    }
-    const result = await bambuMachine.fineAdjustZ(deltaMm);
-    if (!result.success) {
-      alert(result.error || 'Fine Z adjust failed.');
+  const [hoverHeightVal, setHoverHeightVal] = useState<number>(
+    zCalibration.hoverZMm || 25.0
+  );
+
+  // Step 2: Safe Homing
+  const handleSafeHome = async () => {
+    setIsProcessing(true);
+    setActionStatus({ type: 'info', message: 'Homing printer without pen... Nozzle touching bare bed to set machine endstops.' });
+    const res = await bambuMachine.safeHomeNoPen();
+    setIsProcessing(false);
+    if (res.success) {
+      showStatus('success', 'Homing complete! Toolhead lifted safely to Z=30mm.');
+    } else {
+      showStatus('error', res.error || 'Homing failed. Check connection.');
     }
   };
 
-  const handleGoToDrawHeight = async () => {
-    const telemetry = bambuMachine.getTelemetry();
-    if (!telemetry.isConnected || telemetry.connectionMode !== 'mqtt') {
-      alert('Printer not connected via MQTT.');
-      return;
+  const handleMoveToHoverStation = async () => {
+    setIsProcessing(true);
+    setActionStatus({ type: 'info', message: `Moving to Floating Hover Station (Z=${hoverHeightVal}mm) & disabling ABL mesh compensation...` });
+    const res = await bambuMachine.prepareHoverStation(hoverHeightVal);
+    setIsProcessing(false);
+    if (res.success) {
+      showStatus('success', `Toolhead parked at floating hover height (Z=${hoverHeightVal}mm). Mesh leveling disabled. Ready to gently drop pen.`);
+    } else {
+      showStatus('error', res.error || 'Move failed.');
     }
-    if (!zReady) {
-      alert('No bed reference captured yet. Complete Step 2 first.');
-      return;
+  };
+
+  const handleLockPaperZero = async () => {
+    setIsProcessing(true);
+    setActionStatus({ type: 'info', message: 'Flushing queue and locking Paper Zero (M400 -> G92 Z0 -> M400)...' });
+    const res = await bambuMachine.lockPaperZeroG92(travelLiftVal);
+    setIsProcessing(false);
+    if (res.success) {
+      showStatus('success', `Paper Zero established! Toolhead lifted to travel plane (Z=${travelLiftVal.toFixed(1)}mm). Nozzle remains floating ${hoverHeightVal}mm high.`);
+      onSaveZCalibration({
+        ...zCalibration,
+        isCalibrated: true,
+        datumSource: 'pen_drop',
+        paperZeroSet: true,
+        hoverZMm: hoverHeightVal,
+        penReleaseMm: travelLiftVal,
+      });
+    } else {
+      showStatus('error', res.error || 'Failed to lock paper zero.');
     }
-    // After homing, nozzle is at bed (Z=0). Just move Z up by 3mm (draw height).
-    // Use relative move to avoid any XY motion or coordinate issues.
-    await bambuMachine.sendRawGcode('G91 G0 Z3 F600 G90');
-    alert('Moved Z up 3mm to draw height. Adjust pen until tip just touches paper.');
+  };
+
+  const handleTestLiftDrop = async () => {
+    setIsProcessing(true);
+    // Lower to draw (Z=0), wait, lift to travel (Z=travelLiftVal)
+    await bambuMachine.sendRawGcode(`G0 Z0 F1200\n`);
+    await new Promise((r) => setTimeout(r, 600));
+    await bambuMachine.sendRawGcode(`G0 Z${travelLiftVal.toFixed(2)} F1800\n`);
+    setIsProcessing(false);
+    showStatus('info', `Test move executed: Plunged to Z=0 (paper contact) and lifted to Z=${travelLiftVal.toFixed(1)}mm.`);
+  };
+
+  // Step 4: Boundary Presets
+  const applyPresetBounds = (type: 'A4' | 'A5' | 'A6' | 'SQUARE' | 'FULL') => {
+    let w = 140;
+    let h = 140;
+    if (type === 'A4') {
+      // Fit A4 landscape or portrait to bed
+      w = Math.min(spec.width - 20, 160);
+      h = Math.min(spec.depth - 20, 200);
+    } else if (type === 'A5') {
+      w = 148;
+      h = Math.min(spec.depth - 20, 160);
+    } else if (type === 'A6') {
+      w = 105;
+      h = 148;
+    } else if (type === 'SQUARE') {
+      w = Math.min(spec.width - 25, 140);
+      h = w;
+    } else if (type === 'FULL') {
+      w = spec.width - 20;
+      h = spec.depth - 20;
+    }
+
+    const startX = Math.round((spec.width - w) / 2);
+    const startY = Math.round((spec.depth - h) / 2);
+
+    const presetBounds: PaperBounds = {
+      isCalibrated: true,
+      paperType: type,
+      bottomLeft: { x: startX, y: startY },
+      bottomRight: { x: startX + w, y: startY },
+      topLeft: { x: startX, y: startY + h },
+      topRight: { x: startX + w, y: startY + h },
+      widthMm: w,
+      heightMm: h,
+    };
+
+    setBl(presetBounds.bottomLeft);
+    setBr(presetBounds.bottomRight);
+    setTl(presetBounds.topLeft);
+    setTr(presetBounds.topRight);
+    onSavePaperBounds(presetBounds);
+    showStatus('success', `Applied ${type} preset: ${w} × ${h} mm.`);
   };
 
   const handleJog = (axis: 'x' | 'y', dir: number) => {
-    const telemetry = bambuMachine.getTelemetry();
-    if (!telemetry.isConnected || telemetry.connectionMode !== 'mqtt') {
-      alert('Printer not connected! Please open "Bambu Printer Link" and click "Verify & Connect" first.');
-      return;
-    }
     bambuMachine.jog(axis, dir * jogStep);
   };
 
@@ -149,28 +197,10 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
     if (corner === 'tr') setTr(pt);
     if (corner === 'bl') setBl(pt);
     if (corner === 'br') setBr(pt);
+    showStatus('info', `Recorded ${corner.toUpperCase()} at (${pt.x}, ${pt.y}) mm`);
   };
 
-  const handleSaveStep3 = () => {
-    if (!zReady) {
-      alert(
-        'No bed reference captured yet. Go back to Step 2, home the printer, jog Z down until the toolhead stops at the bed, then press "Capture Bed Reference".'
-      );
-      setStep(2);
-      return;
-    }
-    const updated = normalizeZCalibration(
-      {
-        ...zCalibration,
-        penReleaseMm: clampPenRelease(retractionLiftVal),
-      },
-      printerModel
-    );
-    onSaveZCalibration(updated);
-    setStep(4);
-  };
-
-  const handleCompleteWizard = () => {
+  const handleFinishWizard = () => {
     const p1 = tl || { x: 20, y: spec.depth - 20 };
     const p2 = tr || { x: spec.width - 20, y: spec.depth - 20 };
     const p3 = bl || { x: 20, y: 20 };
@@ -196,35 +226,35 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-      <div className="bg-[#12161f] border border-[#232b3b] rounded-xl max-w-3xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 animate-in fade-in duration-150">
+      <div className="bg-[#10141d] border border-[#222b3d] rounded-xl max-w-3xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
         {/* Header */}
-        <div className="px-6 py-4 border-b border-[#232b3b] flex items-center justify-between">
+        <div className="px-6 py-4 border-b border-[#1f2838] flex items-center justify-between bg-[#0b0e14]">
           <div>
             <div className="flex items-center gap-2">
-              <span className="text-xs font-mono uppercase tracking-wider text-emerald-400 font-semibold">
-                Bambu {printerModel === 'A1_MINI' ? 'A1 Mini' : 'A1'}
+              <span className="text-[11px] font-mono uppercase tracking-wider text-emerald-400 font-semibold">
+                {spec.name}
               </span>
               <span className="text-slate-600 text-xs">·</span>
-              <span className="text-xs text-slate-400">One-Time Calibration Wizard</span>
+              <span className="text-xs text-slate-400">Zero-Collision Calibration Wizard</span>
             </div>
-            <h2 className="text-lg font-bold text-white mt-0.5">Pen Offset & Paper Boundary Setup</h2>
+            <h2 className="text-base font-bold text-white mt-0.5">Pen Height Datum & Bed Alignment</h2>
           </div>
           <button
             onClick={onClose}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-[#1e2533] transition-colors"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         {/* Step Indicator */}
-        <div className="px-6 py-3 bg-[#0d1017] border-b border-[#1e2533] flex items-center justify-between text-xs">
+        <div className="px-6 py-3 bg-[#0d1017] border-b border-[#1c2434] flex items-center justify-between text-xs">
           {[
             { num: 1, label: '1. Tape Paper' },
-            { num: 2, label: '2. Bed Reference' },
-            { num: 3, label: '3. Pen Release' },
-            { num: 4, label: '4. Map Boundaries' },
+            { num: 2, label: '2. Safe Home' },
+            { num: 3, label: '3. Seat Pen (G92)' },
+            { num: 4, label: '4. Paper Boundaries' },
           ].map((item) => (
             <div
               key={item.num}
@@ -252,40 +282,62 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
           ))}
         </div>
 
+        {/* Inline Status Banner */}
+        {actionStatus && (
+          <div
+            className={`px-6 py-2.5 text-xs flex items-center gap-2 border-b ${
+              actionStatus.type === 'error'
+                ? 'bg-rose-950/40 text-rose-300 border-rose-900/50'
+                : actionStatus.type === 'success'
+                ? 'bg-emerald-950/40 text-emerald-300 border-emerald-900/50'
+                : 'bg-cyan-950/40 text-cyan-300 border-cyan-900/50'
+            }`}
+          >
+            {actionStatus.type === 'error' ? (
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+            ) : actionStatus.type === 'success' ? (
+              <Check className="w-4 h-4 shrink-0" />
+            ) : (
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+            )}
+            <span>{actionStatus.message}</span>
+          </div>
+        )}
+
         {/* Body content per step */}
-        <div className="p-6 overflow-y-auto flex-1">
+        <div className="p-6 overflow-y-auto flex-1 space-y-4">
           {step === 1 && (
             <div className="space-y-4">
-              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#161c28] border border-[#242e42]">
+              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#141923] border border-[#1e2637]">
                 <div className="p-3 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0">
                   <Layers className="w-6 h-6" />
                 </div>
                 <div>
-                  <h3 className="text-base font-semibold text-white">Step 1: Secure Paper to the PEI Plate</h3>
-                  <p className="text-sm text-slate-300 mt-1 leading-relaxed">
-                    Place a plain sheet of printer paper (Letter, A4, or custom cardstock) onto your PEI build plate. Use low-tack blue painter&apos;s tape along the outer borders to keep the paper firmly flat and taut.
+                  <h3 className="text-sm font-semibold text-white">Step 1: Secure Paper to the PEI Bed</h3>
+                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                    Place your paper (Letter, A4, A5, or watercolor sheet) centered on the PEI spring steel build plate. Use low-tack blue painter&apos;s tape along the outer borders to keep the paper firmly flat and taut with zero bubbling.
                   </p>
                 </div>
               </div>
 
-              {/* Visual Graphic Representation */}
-              <div className="h-56 bg-[#0a0d13] rounded-lg border border-[#1e2636] p-4 flex flex-col items-center justify-center relative">
-                <div className="w-72 h-40 bg-[#1e2533] border-2 border-dashed border-slate-600 rounded-md relative flex items-center justify-center shadow-inner">
-                  <span className="text-xs font-mono text-slate-400">Bambu PEI Bed ({spec.width}×{spec.depth}mm)</span>
-                  {/* Paper sheet */}
-                  <div className="w-52 h-28 bg-slate-100/90 text-slate-800 rounded p-2 flex flex-col items-center justify-center shadow-lg relative">
-                    {/* Tape accents on 4 edges */}
-                    <div className="absolute -top-1 left-4 w-12 h-3 bg-blue-500/80 rounded-xs shadow-sm transform -rotate-2" />
-                    <div className="absolute -top-1 right-4 w-12 h-3 bg-blue-500/80 rounded-xs shadow-sm transform rotate-2" />
-                    <div className="absolute -bottom-1 left-4 w-12 h-3 bg-blue-500/80 rounded-xs shadow-sm transform rotate-2" />
-                    <div className="absolute -bottom-1 right-4 w-12 h-3 bg-blue-500/80 rounded-xs shadow-sm transform -rotate-2" />
-                    <span className="text-xs font-semibold text-slate-700">Plain Printer Paper</span>
-                    <span className="text-[10px] text-slate-500 mt-0.5">Painter&apos;s Tape on Corners</span>
+              {/* Graphic representation */}
+              <div className="h-56 bg-[#07090e] rounded-lg border border-[#1e2637] p-4 flex flex-col items-center justify-center relative">
+                <div className="w-72 h-36 bg-[#18202d] border-2 border-dashed border-slate-600 rounded-md relative flex items-center justify-center shadow-inner">
+                  <span className="text-[11px] font-mono text-slate-400">
+                    Bambu PEI Bed ({spec.width}×{spec.depth}mm)
+                  </span>
+                  <div className="w-52 h-24 bg-slate-100 text-slate-900 rounded p-2 flex flex-col items-center justify-center shadow-lg relative">
+                    <div className="absolute -top-1 left-4 w-10 h-3 bg-blue-500/80 rounded-xs shadow-xs transform -rotate-2" />
+                    <div className="absolute -top-1 right-4 w-10 h-3 bg-blue-500/80 rounded-xs shadow-xs transform rotate-2" />
+                    <div className="absolute -bottom-1 left-4 w-10 h-3 bg-blue-500/80 rounded-xs shadow-xs transform rotate-2" />
+                    <div className="absolute -bottom-1 right-4 w-10 h-3 bg-blue-500/80 rounded-xs shadow-xs transform -rotate-2" />
+                    <span className="text-xs font-bold text-slate-800">Drawing Paper</span>
+                    <span className="text-[10px] text-slate-500">Taped at Corners</span>
                   </div>
                 </div>
-                <div className="mt-3 text-xs text-slate-400 flex items-center gap-2">
-                  <HelpCircle className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>Ensure no tape buckles or wrinkles fold upward into the toolhead path.</span>
+                <div className="mt-3 text-[11px] text-slate-400 flex items-center gap-2">
+                  <HelpCircle className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Ensure tape edges are flat so they do not catch on the pen tip during rapid travel.</span>
                 </div>
               </div>
             </div>
@@ -293,89 +345,45 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
 
           {step === 2 && (
             <div className="space-y-4">
-              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#161c28] border border-[#242e42]">
+              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#141923] border border-[#1e2637]">
                 <div className="p-3 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0">
-                  <Crosshair className="w-6 h-6" />
+                  <ShieldCheck className="w-6 h-6" />
                 </div>
                 <div>
-                  <h3 className="text-base font-semibold text-white">Step 2: Find the Bed, then Capture It</h3>
-                  <p className="text-sm text-slate-300 mt-1 leading-relaxed">
-                    Remove the pen. Home the printer, then jog <strong>Z down</strong> until the toolhead
-                    physically stops at the bed. The printer itself will not let you go lower. Press{' '}
-                    <strong>Capture Bed Reference</strong>: nothing moves. That height is stored, and the
-                    drawing plane is permanently locked to <strong>bed + {Z_SAFETY.BED_CLEARANCE_MM.toFixed(1)} mm</strong>.
+                  <h3 className="text-sm font-semibold text-white">Step 2: Safe Machine Homing (NO PEN INSTALLED)</h3>
+                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                    Bambu A1 printers use the nozzle load-cell sensor to probe the bed. <strong>Do NOT mount the pen yet.</strong> Run Safe Homing: the nozzle will touch the bed once, establish hardware zero, and automatically raise to Z=30mm clearance.
                   </p>
                 </div>
               </div>
 
-              <div className="p-6 bg-[#0a0d13] border border-[#1e2636] rounded-lg text-center space-y-4">
-                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#161c27] text-xs font-mono text-emerald-400 border border-[#273247]">
-                  <span>CURRENT HOTEND: ({bambuMachine.getTelemetry().hotendPos.x.toFixed(1)}, {bambuMachine.getTelemetry().hotendPos.y.toFixed(1)}, {bambuMachine.getTelemetry().hotendPos.z.toFixed(1)} mm)</span>
+              <div className="p-6 bg-[#07090e] border border-[#1e2637] rounded-lg text-center space-y-4">
+                <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-md bg-[#141923] text-xs font-mono text-emerald-400 border border-[#222c3e]">
+                  <span>HOTEND POSITION: ({telemetry.hotendPos.x.toFixed(1)}, {telemetry.hotendPos.y.toFixed(1)}, {telemetry.hotendPos.z.toFixed(1)} mm)</span>
                 </div>
 
-                <div className="flex flex-wrap items-center justify-center gap-2">
+                <div className="flex flex-wrap items-center justify-center gap-3">
                   <button
-                    onClick={handleHomeAll}
-                    className="px-4 py-2 bg-[#1b2333] hover:bg-[#253047] text-slate-300 text-xs rounded-lg border border-[#2a3447]"
-                  >
-                    Home All (G28)
-                  </button>
-                  <button
-                    onClick={handleRefreshPosition}
-                    className="px-4 py-2 bg-[#1b2333] hover:bg-[#253047] text-cyan-300 text-xs rounded-lg border border-cyan-500/30"
-                    title="Request fresh position from printer"
-                  >
-                    Refresh Position
-                  </button>
-                </div>
-
-                {/* Fine Z Adjust */}
-                <div className="flex flex-wrap items-center justify-center gap-2 pt-2 border-t border-[#1e2636]">
-                  <span className="text-[10px] text-slate-500">Fine Adjust Z:</span>
-                  <button
-                    onClick={() => handleFineAdjustZ(-0.05)}
-                    className="px-3 py-1.5 bg-rose-600/80 hover:bg-rose-500 text-white text-xs font-bold rounded-lg border border-rose-500/30"
-                    title="Lower Z by 0.05mm (toward bed)"
-                  >
-                    −0.05mm
-                  </button>
-                  <button
-                    onClick={() => handleFineAdjustZ(0.05)}
-                    className="px-3 py-1.5 bg-emerald-600/80 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg border border-emerald-500/30"
-                    title="Raise Z by 0.05mm (away from bed)"
-                  >
-                    +0.05mm
-                  </button>
-                  <button
-                    onClick={() => handleFineAdjustZ(-0.1)}
-                    className="px-3 py-1.5 bg-rose-600/60 hover:bg-rose-500 text-white text-xs font-bold rounded-lg border border-rose-500/20"
-                    title="Lower Z by 0.1mm"
-                  >
-                    −0.1mm
-                  </button>
-                  <button
-                    onClick={() => handleFineAdjustZ(0.1)}
-                    className="px-3 py-1.5 bg-emerald-600/60 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg border border-emerald-500/20"
-                    title="Raise Z by 0.1mm"
-                  >
-                    +0.1mm
-                  </button>
-                </div>
-
-                <div className="pt-2 border-t border-[#1e2636]">
-                  <button
-                    onClick={handleCaptureBedReference}
-                    className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm rounded-lg shadow-lg shadow-emerald-950/40 transition-all flex items-center gap-2 mx-auto"
+                    onClick={handleSafeHome}
+                    disabled={isProcessing}
+                    className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-lg shadow-emerald-950/40 transition-colors flex items-center gap-2 cursor-pointer"
                   >
                     <Crosshair className="w-4 h-4" />
-                    <span>Capture Bed Reference</span>
+                    <span>1. Safe Home All Axes (G28)</span>
                   </button>
-                  <p className="text-xs text-slate-400 mt-2">
-                    No motion, no bed probing. Draw plane:{' '}
-                    <span className="font-mono text-emerald-400">
-                      {zReady ? `${previewDrawZ.toFixed(2)} mm` : 'waiting for capture'}
-                    </span>
-                  </p>
+
+                  <button
+                    onClick={handleMoveToHoverStation}
+                    disabled={isProcessing}
+                    className="px-5 py-2.5 bg-[#1a2333] hover:bg-[#232e42] disabled:opacity-50 text-cyan-300 text-xs font-bold rounded-lg border border-cyan-500/30 transition-colors flex items-center gap-2 cursor-pointer"
+                  >
+                    <Move className="w-4 h-4 text-cyan-400" />
+                    <span>2. Move to Floating Hover Station</span>
+                  </button>
+                </div>
+
+                <div className="text-[11px] text-slate-400 max-w-md mx-auto leading-relaxed pt-2">
+                  Once homed, move to the floating hover station. The nozzle will park safely ~25mm in the air and bed leveling compensation will be disabled so the height never drifts.
                 </div>
               </div>
             </div>
@@ -383,245 +391,184 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
 
           {step === 3 && (
             <div className="space-y-4">
-              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#161c28] border border-[#242e42]">
+              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#141923] border border-[#1e2637]">
                 <div className="p-3 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0">
-                  <ArrowDown className="w-6 h-6" />
+                  <Crosshair className="w-6 h-6" />
                 </div>
                 <div>
-                  <h3 className="text-base font-semibold text-white">Step 3: Seat the Pen & Set Release Height</h3>
-                  <p className="text-sm text-slate-300 mt-1 leading-relaxed">
-                    Move the toolhead to the fixed drawing plane ({previewDrawZ.toFixed(2)} mm) and
-                    physically adjust the pen in its holder until the tip <strong>just touches the paper</strong>.
-                    There is no pen-height calibration anymore. The only adjustable value is the{' '}
-                    <strong>pen release height</strong>: how far the pen lifts between strokes.
+                  <h3 className="text-sm font-semibold text-white">Step 3: Floating Nozzle Seating &amp; Paper Zero (G92 Z0)</h3>
+                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                    The hotend nozzle floats safely in the air at <strong>Z={hoverHeightVal}mm</strong> (well clear of the bed). Loosen the clamp thumbscrew, let the pen slide down under gravity until the tip gently touches the paper, and tighten the clamp with zero downforce. Then click <strong>Lock Paper Zero</strong>!
                   </p>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="p-4 bg-[#141a26] border border-[#242e42] rounded-lg space-y-3">
-                  <div className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-                    Locked Heights
+              <div className="p-6 bg-[#07090e] border border-[#1e2637] rounded-lg space-y-5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Action 1 */}
+                  <div className="bg-[#121722] border border-[#1f2838] p-4 rounded-lg space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-cyan-400 font-mono font-bold">ACTION 1</span>
+                      <span className="text-[10px] text-slate-400 font-mono">Nozzle floats {hoverHeightVal}mm high</span>
+                    </div>
+                    <h4 className="text-xs font-bold text-white">Park at Safe Floating Height</h4>
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Freezes Z plane (disables ABL mesh tilt) and floats nozzle at Z={hoverHeightVal}mm.
+                    </p>
+                    <div className="flex items-center gap-2 pt-1">
+                      <button
+                        onClick={handleMoveToHoverStation}
+                        disabled={isProcessing}
+                        className="flex-1 py-2 bg-[#1b2333] hover:bg-[#253147] text-slate-200 text-xs font-semibold rounded-lg border border-[#27344c] transition-colors cursor-pointer"
+                      >
+                        Hover Toolhead (Z={hoverHeightVal}mm)
+                      </button>
+                      <input
+                        type="number"
+                        min="15"
+                        max="40"
+                        step="1"
+                        value={hoverHeightVal}
+                        onChange={(e) => setHoverHeightVal(Math.max(15, Math.min(40, parseFloat(e.target.value) || 25)))}
+                        className="w-16 bg-[#0d1017] border border-[#263145] text-white px-2 py-1.5 rounded text-xs font-mono text-center"
+                        title="Floating Hover Height (mm)"
+                      />
+                    </div>
                   </div>
-                  <div className="space-y-2 text-xs font-mono">
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Captured bed reference</span>
-                      <span className="text-white">{bedRef.toFixed(2)} mm</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Drawing plane (fixed)</span>
-                      <span className="text-emerald-400">{previewDrawZ.toFixed(2)} mm</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">Bed clearance</span>
-                      <span className="text-white">{Z_SAFETY.BED_CLEARANCE_MM.toFixed(2)} mm</span>
-                    </div>
+
+                  {/* Action 2 */}
+                  <div className="bg-[#121722] border border-[#1f2838] p-4 rounded-lg space-y-2">
+                    <span className="text-[10px] text-emerald-400 font-mono font-bold">ACTION 2</span>
+                    <h4 className="text-xs font-bold text-white">Lock Paper Zero (G92 Z0)</h4>
+                    <p className="text-[11px] text-slate-400 leading-snug">
+                      Locks paper surface as Z=0 with M400 sync and lifts pen to travel height.
+                    </p>
+                    <button
+                      onClick={handleLockPaperZero}
+                      disabled={isProcessing}
+                      className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg shadow-md transition-colors cursor-pointer mt-1"
+                    >
+                      Lock Paper Zero &amp; Lift Pen
+                    </button>
                   </div>
-                  <p className="text-[11px] text-slate-500">
-                    The drawing plane cannot be edited. Re-run Step 2 if the bed reference is wrong.
-                  </p>
-                  <button
-                    onClick={handleGoToDrawHeight}
-                    className="w-full py-2 bg-emerald-600/80 hover:bg-emerald-500 text-white text-xs font-semibold rounded-lg flex items-center justify-center gap-2 transition-colors"
-                    title="Move toolhead to draw height (bed + 1mm) so you can seat the pen"
-                  >
-                    <ArrowDown className="w-3.5 h-3.5" />
-                    <span>Go to Draw Height (bed + 1mm)</span>
-                  </button>
                 </div>
 
-                <div className="p-4 bg-[#141a26] border border-[#242e42] rounded-lg space-y-3">
-                  <label className="block text-xs font-semibold uppercase tracking-wider text-slate-300">
-                    Pen Release Height ({Z_SAFETY.MIN_PEN_RELEASE_MM}–{Z_SAFETY.MAX_PEN_RELEASE_MM} mm)
-                  </label>
-                  <div className="flex items-center gap-3">
-                    <input
-                      type="number"
-                      step="0.1"
-                      min={Z_SAFETY.MIN_PEN_RELEASE_MM}
-                      max={Z_SAFETY.MAX_PEN_RELEASE_MM}
-                      value={retractionLiftVal}
-                      onChange={(e) => setRetractionLiftVal(clampPenRelease(e.target.value))}
-                      className="bg-[#0b0e14] border border-[#28344a] text-white px-3 py-2 rounded-lg font-mono text-sm w-28 focus:outline-hidden focus:border-emerald-500"
-                    />
-                    <span className="text-xs text-slate-400">mm above draw plane</span>
+                {/* Travel Lift Slider */}
+                <div className="pt-3 border-t border-[#1e2637] space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-300 font-medium">Pen Travel Lift Clearance:</span>
+                    <span className="font-mono font-bold text-emerald-400">{travelLiftVal.toFixed(1)} mm</span>
                   </div>
-                  <p className="text-xs text-slate-500">
-                    Rapid moves use {previewTravelZ.toFixed(2)}mm; drawing uses{' '}
-                    {previewDrawZ.toFixed(2)}mm.
-                  </p>
-                </div>
-              </div>
+                  <input
+                    type="range"
+                    min="2.0"
+                    max="6.0"
+                    step="0.5"
+                    value={travelLiftVal}
+                    onChange={(e) => setTravelLiftVal(parseFloat(e.target.value))}
+                    className="w-full accent-emerald-500 h-1.5 bg-[#1b2333] rounded-lg cursor-pointer"
+                  />
+                  <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                    <span>2.0mm (Fast / Flat paper)</span>
+                    <span>3.5mm (Recommended)</span>
+                    <span>6.0mm (Thick cardstock)</span>
+                  </div>
 
-              <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg flex items-start gap-2.5 text-xs text-amber-300">
-                <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>
-                  Clicking Next saves the bed reference and pen release height. A Z lower than the
-                  drawing plane is rejected by the UI, the machine controller and the server.
-                </span>
+                  <div className="pt-2 flex justify-end">
+                    <button
+                      onClick={handleTestLiftDrop}
+                      disabled={isProcessing}
+                      className="px-3 py-1.5 bg-[#161c28] hover:bg-[#202738] text-slate-300 text-[11px] rounded border border-[#273347] transition-colors cursor-pointer"
+                    >
+                      Test Lift & Drop
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}
 
           {step === 4 && (
             <div className="space-y-4">
-              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#161c28] border border-[#242e42]">
+              <div className="flex items-start gap-4 p-4 rounded-lg bg-[#141923] border border-[#1e2637]">
                 <div className="p-3 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0">
-                  <Crosshair className="w-6 h-6" />
+                  <Move className="w-6 h-6" />
                 </div>
                 <div>
-                  <h3 className="text-base font-semibold text-white">Step 4: Map 4 Coordinates of Paper Sheet</h3>
-                  <p className="text-sm text-slate-300 mt-1 leading-relaxed">
-                    At the captured drawing height, use the jog controls below to move the toolhead and bed slinger to each corner of your taped paper sheet. Click each button to record TOP LEFT, TOP RIGHT, BOTTOM LEFT, and BOTTOM RIGHT.
+                  <h3 className="text-sm font-semibold text-white">Step 4: Paper Boundaries</h3>
+                  <p className="text-xs text-slate-300 mt-1 leading-relaxed">
+                    Pick a standard paper preset or jog the toolhead to record your custom corners. The software automatically maps the printable vector canvas inside this bounding box.
                   </p>
                 </div>
               </div>
 
-              {/* Live Coordinates HUD */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                <div className="p-2.5 bg-[#0e121a] border border-[#20293a] rounded-lg">
-                  <div className="text-[10px] uppercase font-mono text-slate-400">Pen Live (X, Y)</div>
-                  <div className="text-sm font-mono font-bold text-cyan-400 mt-0.5">
-                    {currentPenPos.x.toFixed(1)}, {currentPenPos.y.toFixed(1)} mm
-                  </div>
-                </div>
-                <div className="p-2.5 bg-[#0e121a] border border-[#20293a] rounded-lg">
-                  <div className="text-[10px] uppercase font-mono text-slate-400">Nozzle Live (X, Y)</div>
-                  <div className="text-sm font-mono font-bold text-slate-300 mt-0.5">
-                    {(currentPenPos.x - penOffset.x).toFixed(1)}, {(currentPenPos.y - penOffset.y).toFixed(1)} mm
-                  </div>
-                </div>
-                <div className="p-2.5 bg-[#0e121a] border border-[#20293a] rounded-lg">
-                  <div className="text-[10px] uppercase font-mono text-slate-400">Hotend-to-Pen Offset</div>
-                  <div className="text-sm font-mono font-bold text-emerald-400 mt-0.5">
-                    X:{penOffset.x} Y:{penOffset.y}mm
-                  </div>
-                </div>
-                <div className="p-2.5 bg-[#0e121a] border border-[#20293a] rounded-lg">
-                  <div className="text-[10px] uppercase font-mono text-slate-400">Jog Step Size</div>
-                  <div className="flex gap-1 mt-0.5">
-                    {[1, 5, 10, 25].map((s) => (
-                      <button
-                        key={s}
-                        onClick={() => setJogStep(s)}
-                        className={`px-1.5 py-0.5 text-[10px] font-mono rounded ${
-                          jogStep === s ? 'bg-emerald-600 text-white' : 'bg-[#1b2333] text-slate-400 hover:text-white'
-                        }`}
-                      >
-                        {s}mm
-                      </button>
-                    ))}
-                  </div>
+              {/* Quick Presets */}
+              <div className="p-4 bg-[#07090e] border border-[#1e2637] rounded-lg space-y-3">
+                <span className="text-[11px] font-semibold text-slate-300 uppercase tracking-wider">
+                  Quick Standard Presets:
+                </span>
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <button
+                    onClick={() => applyPresetBounds('A4')}
+                    className="p-2.5 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded-lg text-left transition-colors cursor-pointer"
+                  >
+                    <span className="text-xs font-bold text-white block">A4 Sheet</span>
+                    <span className="text-[10px] text-slate-400 font-mono">Fit to bed</span>
+                  </button>
+                  <button
+                    onClick={() => applyPresetBounds('A5')}
+                    className="p-2.5 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded-lg text-left transition-colors cursor-pointer"
+                  >
+                    <span className="text-xs font-bold text-white block">A5 Sheet</span>
+                    <span className="text-[10px] text-slate-400 font-mono">148×160mm</span>
+                  </button>
+                  <button
+                    onClick={() => applyPresetBounds('A6')}
+                    className="p-2.5 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded-lg text-left transition-colors cursor-pointer"
+                  >
+                    <span className="text-xs font-bold text-white block">A6 Postcard</span>
+                    <span className="text-[10px] text-slate-400 font-mono">105×148mm</span>
+                  </button>
+                  <button
+                    onClick={() => applyPresetBounds('SQUARE')}
+                    className="p-2.5 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded-lg text-left transition-colors cursor-pointer"
+                  >
+                    <span className="text-xs font-bold text-white block">Square</span>
+                    <span className="text-[10px] text-slate-400 font-mono">140×140mm</span>
+                  </button>
+                  <button
+                    onClick={() => applyPresetBounds('FULL')}
+                    className="p-2.5 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded-lg text-left transition-colors cursor-pointer"
+                  >
+                    <span className="text-xs font-bold text-white block">Full Bed</span>
+                    <span className="text-[10px] text-slate-400 font-mono">{spec.width - 20}×{spec.depth - 20}mm</span>
+                  </button>
                 </div>
               </div>
 
-              {/* Jog Direction Pad (Bed Slinger Kinematics) */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 bg-[#0a0d13] p-4 rounded-lg border border-[#1e2636]">
-                <div className="flex flex-col items-center justify-center space-y-2">
-                  <span className="text-xs font-mono uppercase tracking-wider text-slate-400">
-                    Bed Slinger (Y) & Toolhead (X) Jog
-                  </span>
-                  <div className="grid grid-cols-3 gap-1.5 w-44">
-                    <div />
-                    <button
-                      onClick={() => handleJog('y', 1)}
-                      className="p-2 bg-[#1b2333] hover:bg-[#253047] text-white rounded font-mono text-xs font-bold flex flex-col items-center justify-center border border-[#28364c]"
-                      title="Bed slides backward (+Y coordinate)"
-                    >
-                      <span>+Y</span>
-                      <span className="text-[8px] text-slate-400">Bed Back</span>
-                    </button>
-                    <div />
-                    <button
-                      onClick={() => handleJog('x', -1)}
-                      className="p-2 bg-[#1b2333] hover:bg-[#253047] text-white rounded font-mono text-xs font-bold flex flex-col items-center justify-center border border-[#28364c]"
-                      title="Toolhead travels Left (-X coordinate)"
-                    >
-                      <span>-X</span>
-                      <span className="text-[8px] text-slate-400">Head Left</span>
-                    </button>
-                    <div />
-                    <button
-                      onClick={() => handleJog('x', 1)}
-                      className="p-2 bg-[#1b2333] hover:bg-[#253047] text-white rounded font-mono text-xs font-bold flex flex-col items-center justify-center border border-[#28364c]"
-                      title="Toolhead travels Right (+X coordinate)"
-                    >
-                      <span>+X</span>
-                      <span className="text-[8px] text-slate-400">Head Right</span>
-                    </button>
-                    <div />
-                    <button
-                      onClick={() => handleJog('y', -1)}
-                      className="p-2 bg-[#1b2333] hover:bg-[#253047] text-white rounded font-mono text-xs font-bold flex flex-col items-center justify-center border border-[#28364c]"
-                      title="Bed slides forward toward user (-Y coordinate)"
-                    >
-                      <span>-Y</span>
-                      <span className="text-[8px] text-slate-400">Bed Front</span>
-                    </button>
-                    <div />
-                  </div>
-                </div>
-
-                {/* 4 Corner Capture Buttons */}
-                <div className="grid grid-cols-2 gap-2">
+              {/* Manual Jog & Record */}
+              <div className="p-4 bg-[#07090e] border border-[#1e2637] rounded-lg space-y-3">
+                <span className="text-[11px] font-semibold text-slate-300 uppercase tracking-wider">
+                  Or Manually Jog to Corners:
+                </span>
+                <div className="grid grid-cols-2 gap-3 text-xs">
                   <button
                     onClick={() => recordCorner('tl')}
-                    className={`p-3 rounded-lg border text-left transition-all ${
-                      tl ? 'bg-cyan-950/40 border-cyan-500 text-cyan-200' : 'bg-[#141b27] border-[#253147] text-slate-300 hover:border-slate-500'
-                    }`}
+                    className="p-2 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded text-left transition-colors cursor-pointer"
                   >
-                    <div className="flex items-center justify-between text-xs font-semibold">
-                      <span>1. TOP LEFT</span>
-                      {tl && <Check className="w-3.5 h-3.5 text-cyan-400" />}
-                    </div>
-                    <div className="text-[11px] font-mono mt-1 text-slate-400">
-                      {tl ? `(${tl.x}, ${tl.y}) mm` : 'Click to save pos'}
-                    </div>
+                    <span className="font-semibold text-slate-200 block">Top-Left</span>
+                    <span className="text-[10px] text-emerald-400 font-mono">
+                      {tl ? `(${tl.x}, ${tl.y}) mm` : 'Not recorded'}
+                    </span>
                   </button>
-
-                  <button
-                    onClick={() => recordCorner('tr')}
-                    className={`p-3 rounded-lg border text-left transition-all ${
-                      tr ? 'bg-cyan-950/40 border-cyan-500 text-cyan-200' : 'bg-[#141b27] border-[#253147] text-slate-300 hover:border-slate-500'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between text-xs font-semibold">
-                      <span>2. TOP RIGHT</span>
-                      {tr && <Check className="w-3.5 h-3.5 text-cyan-400" />}
-                    </div>
-                    <div className="text-[11px] font-mono mt-1 text-slate-400">
-                      {tr ? `(${tr.x}, ${tr.y}) mm` : 'Click to save pos'}
-                    </div>
-                  </button>
-
-                  <button
-                    onClick={() => recordCorner('bl')}
-                    className={`p-3 rounded-lg border text-left transition-all ${
-                      bl ? 'bg-cyan-950/40 border-cyan-500 text-cyan-200' : 'bg-[#141b27] border-[#253147] text-slate-300 hover:border-slate-500'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between text-xs font-semibold">
-                      <span>3. BOTTOM LEFT</span>
-                      {bl && <Check className="w-3.5 h-3.5 text-cyan-400" />}
-                    </div>
-                    <div className="text-[11px] font-mono mt-1 text-slate-400">
-                      {bl ? `(${bl.x}, ${bl.y}) mm` : 'Click to save pos'}
-                    </div>
-                  </button>
-
                   <button
                     onClick={() => recordCorner('br')}
-                    className={`p-3 rounded-lg border text-left transition-all ${
-                      br ? 'bg-cyan-950/40 border-cyan-500 text-cyan-200' : 'bg-[#141b27] border-[#253147] text-slate-300 hover:border-slate-500'
-                    }`}
+                    className="p-2 bg-[#141923] hover:bg-[#1e2638] border border-[#242e42] rounded text-left transition-colors cursor-pointer"
                   >
-                    <div className="flex items-center justify-between text-xs font-semibold">
-                      <span>4. BOTTOM RIGHT</span>
-                      {br && <Check className="w-3.5 h-3.5 text-cyan-400" />}
-                    </div>
-                    <div className="text-[11px] font-mono mt-1 text-slate-400">
-                      {br ? `(${br.x}, ${br.y}) mm` : 'Click to save pos'}
-                    </div>
+                    <span className="font-semibold text-slate-200 block">Bottom-Right</span>
+                    <span className="text-[10px] text-emerald-400 font-mono">
+                      {br ? `(${br.x}, ${br.y}) mm` : 'Not recorded'}
+                    </span>
                   </button>
                 </div>
               </div>
@@ -630,55 +577,35 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
         </div>
 
         {/* Footer Navigation */}
-        <div className="px-6 py-4 border-t border-[#232b3b] bg-[#0f131c] flex items-center justify-between">
+        <div className="px-6 py-4 border-t border-[#1f2838] bg-[#0b0e14] flex items-center justify-between">
           <div>
             {step > 1 && (
               <button
-                onClick={() => setStep(step - 1)}
-                className="px-4 py-2 rounded-lg text-xs font-medium text-slate-300 hover:text-white bg-[#1b2230] hover:bg-[#242e40] flex items-center gap-1.5 transition-colors"
+                onClick={() => setStep((s) => s - 1)}
+                className="px-4 py-2 text-xs font-semibold text-slate-400 hover:text-white flex items-center gap-1 cursor-pointer"
               >
                 <ChevronLeft className="w-4 h-4" />
-                <span>Previous Step</span>
-              </button>
-            )}
-            {step === 1 && (
-              <button
-                onClick={onClearCalibration}
-                className="text-xs text-rose-400 hover:text-rose-300 underline underline-offset-4"
-              >
-                Clear Existing Calibration Settings
+                <span>Back</span>
               </button>
             )}
           </div>
 
           <div className="flex items-center gap-3">
-            {step < 3 && (
+            {step < 4 ? (
               <button
-                onClick={() => setStep(step + 1)}
-                className="px-5 py-2 rounded-lg text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 shadow-md shadow-emerald-950/40 flex items-center gap-1.5 transition-colors"
+                onClick={() => setStep((s) => s + 1)}
+                className="px-5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg flex items-center gap-1.5 shadow-md cursor-pointer"
               >
-                <span>Continue to Step {step + 1}</span>
+                <span>Continue</span>
                 <ChevronRight className="w-4 h-4" />
               </button>
-            )}
-
-            {step === 3 && (
+            ) : (
               <button
-                onClick={handleSaveStep3}
-                className="px-5 py-2 rounded-lg text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 shadow-md shadow-emerald-950/40 flex items-center gap-1.5 transition-colors"
+                onClick={handleFinishWizard}
+                className="px-6 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg flex items-center gap-1.5 shadow-lg shadow-emerald-950/40 cursor-pointer"
               >
-                <span>Save Bed Reference & Map Paper</span>
-                <ChevronRight className="w-4 h-4" />
-              </button>
-            )}
-
-            {step === 4 && (
-              <button
-                onClick={handleCompleteWizard}
-                className="px-6 py-2 rounded-lg text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 shadow-md shadow-emerald-950/40 flex items-center gap-2 transition-colors font-semibold"
-              >
-                <Sparkles className="w-4 h-4" />
-                <span>Save Boundaries & Ready to Print</span>
+                <Check className="w-4 h-4" />
+                <span>Finish & Save Calibration</span>
               </button>
             )}
           </div>

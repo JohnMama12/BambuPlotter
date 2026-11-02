@@ -389,7 +389,7 @@ export function generateVectorTextPaths(
     lineHeight?: number;
     fillStyle?: 'outline' | 'hatch' | 'crosshatch' | 'stipple';
     penDiameter?: number;
-  }
+  } = {}
 ): PathSegment[] {
   if (!text || !text.trim()) return [];
 

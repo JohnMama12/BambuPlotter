@@ -1,6 +1,7 @@
 import { Point2D, PathSegment, CanvasElement, InfillPattern, PenDefinition } from '../types/plotter';
 import { traceContours, generatePolygonInfill } from './contourTracer';
 import { parseSvgToSegments, optimizeTravelOrder } from './vectorEngine';
+import { generateVectorTextPaths } from './vectorFont';
 
 /**
  * High-Precision Vector & 3D Print First-Layer Slicer Engine.
@@ -19,6 +20,10 @@ export function sliceElementToToolpaths(
   const diameter = Math.max(0.2, pen.diameter || 0.7);
   const pattern = element.fillStyle || 'outline';
   const precision = element.vectorPrecision || 7;
+  const hatchAngle = element.hatchAngle !== undefined ? element.hatchAngle : (element.infillAngle ?? 45);
+  const hatchSpacing = element.hatchSpacingMm !== undefined && element.hatchSpacingMm > 0
+    ? Math.max(0.2, element.hatchSpacingMm)
+    : Math.max(0.3, diameter * 1.2);
 
   if (element.type === 'circle') {
     const r = element.radius || Math.min(element.width, element.height) / 2;
@@ -37,7 +42,7 @@ export function sliceElementToToolpaths(
     }
     segments.push({ points: perimeter, penId: element.penId, qualityPreset: element.qualityPreset });
 
-    // 2. First-Layer Infill Patterns
+    // 2. Vector Infill / Hatch Patterns
     if (pattern === 'concentric') {
       // Concentric rings shrinking inward by pen diameter steps
       for (let curR = r - diameter; curR > diameter * 0.5; curR -= diameter) {
@@ -54,14 +59,12 @@ export function sliceElementToToolpaths(
       }
       // Center dot
       segments.push({ points: [{ x: cx, y: cy }], penId: element.penId, isPeck: true });
-    } else if (pattern === 'monotonic' || pattern === 'rectilinear') {
-      // Monotonic 45-degree sweep across circle from tip to tip
-      const sweepSegments = generateCircleMonotonicInfill(cx, cy, r - diameter * 0.5, diameter, element.penId);
+    } else if (pattern === 'parallel_hatch' || pattern === 'monotonic' || pattern === 'rectilinear') {
+      const sweepSegments = generateCircleHatchInfill(cx, cy, r - diameter * 0.5, hatchSpacing, element.penId, hatchAngle);
       segments.push(...sweepSegments);
-    } else if (pattern === 'grid') {
-      // Orthogonal grid infill
-      const sweep1 = generateCircleMonotonicInfill(cx, cy, r - diameter * 0.5, diameter * 1.5, element.penId, 45);
-      const sweep2 = generateCircleMonotonicInfill(cx, cy, r - diameter * 0.5, diameter * 1.5, element.penId, 135);
+    } else if (pattern === 'crosshatch' || pattern === 'grid') {
+      const sweep1 = generateCircleHatchInfill(cx, cy, r - diameter * 0.5, hatchSpacing, element.penId, hatchAngle);
+      const sweep2 = generateCircleHatchInfill(cx, cy, r - diameter * 0.5, hatchSpacing, element.penId, hatchAngle + 90);
       segments.push(...sweep1, ...sweep2);
     }
   } else if (element.type === 'rect') {
@@ -80,7 +83,7 @@ export function sliceElementToToolpaths(
       penId: element.penId,
     });
 
-    // 2. Infill Patterns
+    // 2. Vector Infill / Hatch Patterns
     if (pattern === 'concentric') {
       let curInset = diameter;
       while (w - curInset * 2 > diameter * 0.5 && h - curInset * 2 > diameter * 0.5) {
@@ -96,12 +99,12 @@ export function sliceElementToToolpaths(
         });
         curInset += diameter;
       }
-    } else if (pattern === 'monotonic' || pattern === 'rectilinear') {
-      const rectInfill = generateRectMonotonicInfill(w, h, diameter, element.penId);
+    } else if (pattern === 'parallel_hatch' || pattern === 'monotonic' || pattern === 'rectilinear') {
+      const rectInfill = generateRectHatchInfill(w, h, hatchSpacing, element.penId, hatchAngle);
       segments.push(...rectInfill);
-    } else if (pattern === 'grid') {
-      const g1 = generateRectMonotonicInfill(w, h, diameter * 1.8, element.penId, 45);
-      const g2 = generateRectMonotonicInfill(w, h, diameter * 1.8, element.penId, 135);
+    } else if (pattern === 'crosshatch' || pattern === 'grid') {
+      const g1 = generateRectHatchInfill(w, h, hatchSpacing, element.penId, hatchAngle);
+      const g2 = generateRectHatchInfill(w, h, hatchSpacing, element.penId, hatchAngle + 90);
       segments.push(...g1, ...g2);
     }
   } else if (element.type === 'line') {
@@ -142,98 +145,38 @@ function sliceTextToVectorPaths(element: CanvasElement, pen: PenDefinition): Pat
   const isUnderline = !!element.isUnderline;
   const align = element.textAlign || 'left';
   const lineHeight = element.lineHeight || 1.35;
-  const fontFam = element.fontFamily || 'Arial';
-  const precision = element.vectorPrecision || 7;
   const diameter = Math.max(0.2, pen.diameter || 0.7);
 
-  // Subpixel sampling rate based on vector precision (6 to 12 px/mm)
-  const dpr = Math.min(12, Math.max(6, Math.round(precision * 1.2)));
+  const rawSegments = generateVectorTextPaths(text, fontSizeMm, element.penId, {
+    isBold,
+    isItalic,
+    isUnderline,
+    textAlign: align,
+    lineHeight,
+    penDiameter: diameter,
+  });
+
   const lines = text.split('\n');
-  const linePx = fontSizeMm * dpr * lineHeight;
-  const fontPx = Math.round(fontSizeMm * dpr);
+  const lineSpacing = fontSizeMm * lineHeight;
+  const totalH = Math.max(element.height || 0, lines.length * lineSpacing);
 
-  const canvas = document.createElement('canvas');
-  const testCtx = canvas.getContext('2d');
-  // System font fallback stack ensuring ANY system font is parsed properly
-  const fontSpec = `${isItalic ? 'italic ' : ''}${isBold ? 'bold ' : 'normal '}${fontPx}px "${fontFam}", sans-serif`;
-  if (testCtx) testCtx.font = fontSpec;
-
-  let maxLineWidth = 100;
-  if (testCtx) {
-    for (const l of lines) {
-      const w = testCtx.measureText(l).width;
-      if (w > maxLineWidth) maxLineWidth = w;
-    }
-  }
-
-  const paddingPx = 20;
-  canvas.width = Math.ceil(maxLineWidth + paddingPx * 2);
-  canvas.height = Math.ceil(lines.length * linePx + paddingPx * 2);
-
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return [];
-
-  ctx.fillStyle = '#000000';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.font = fontSpec;
-  ctx.fillStyle = '#ffffff';
-  ctx.textBaseline = 'top';
-
-  for (let l = 0; l < lines.length; l++) {
-    const lineText = lines[l];
-    const metrics = ctx.measureText(lineText);
-    let startX = paddingPx;
-    if (align === 'center') {
-      startX = Math.max(paddingPx, (canvas.width - metrics.width) / 2);
-    } else if (align === 'right') {
-      startX = Math.max(paddingPx, canvas.width - metrics.width - paddingPx);
-    }
-
-    const currentY = paddingPx + l * linePx;
-    ctx.fillText(lineText, startX, currentY);
-
-    if (isUnderline) {
-      const underlineY = currentY + fontPx * 1.05;
-      const underlineH = Math.max(2, Math.round(fontPx * 0.08));
-      ctx.fillRect(startX, underlineY, metrics.width, underlineH);
-    }
-  }
-
-  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const mmPerPx = 1 / dpr;
-
-  // Extract smooth subpixel vector contours
-  const contours = traceContours(imgData.data, canvas.width, canvas.height, mmPerPx, precision);
-
-  // 1. Boundary Perimeter Toolpaths
-  const outlineSegments: PathSegment[] = contours.map((pts) => ({
-    points: pts,
-    penId: element.penId,
-    qualityPreset: element.qualityPreset,
-  }));
-
-  // 2. Real-time Infill Toolpaths (Monotonic by default!)
-  const infillPattern = element.fillStyle || 'monotonic';
-  const infillSegments: PathSegment[] = generatePolygonInfill(
-    contours,
-    diameter,
-    infillPattern,
-    element.penId,
-    element.infillAngle || 45
-  ).map((seg) => ({
+  // In vectorFont: curY starts at 0 (top line) and goes down.
+  // In Bed Cartesian coordinates, Y=0 is bottom and increases upward.
+  // We flip Y so line 1 is rendered at the top of the element box.
+  return rawSegments.map((seg) => ({
     ...seg,
     qualityPreset: element.qualityPreset,
+    points: seg.points.map((pt) => ({
+      x: Math.round(pt.x * 100) / 100,
+      y: Math.round((totalH - pt.y - fontSizeMm * 0.9) * 100) / 100,
+    })),
   }));
-
-  return [...outlineSegments, ...infillSegments];
 }
 
 /**
- * 3D Print First-Layer Monotonic Infill across Circle.
- * Sweeps lines monotonically from tip to tip inside circle radius.
+ * Universal Vector Hatch Infill across Circle at any angle (0 to 180 deg).
  */
-function generateCircleMonotonicInfill(
+function generateCircleHatchInfill(
   cx: number,
   cy: number,
   radius: number,
@@ -242,22 +185,21 @@ function generateCircleMonotonicInfill(
   angleDeg: number = 45
 ): PathSegment[] {
   const segments: PathSegment[] = [];
-  const numLines = Math.floor((radius * 2) / spacing);
   const rad = (angleDeg * Math.PI) / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
 
+  const numLines = Math.floor((radius * 2) / spacing);
   for (let i = 1; i < numLines; i++) {
     const offset = -radius + i * spacing;
-    // Half chord length at distance offset from center
     const chordSq = radius * radius - offset * offset;
     if (chordSq > 0) {
       const halfChord = Math.sqrt(chordSq);
-      // Local line points: (-halfChord, offset) to (+halfChord, offset)
-      const p1x = cx + (-halfChord * -sin + offset * cos);
-      const p1y = cy + (-halfChord * cos + offset * sin);
-      const p2x = cx + (halfChord * -sin + offset * cos);
-      const p2y = cy + (halfChord * cos + offset * sin);
+      // Along line: (cos, sin), normal: (-sin, cos)
+      const p1x = cx - offset * sin - halfChord * cos;
+      const p1y = cy + offset * cos - halfChord * sin;
+      const p2x = cx - offset * sin + halfChord * cos;
+      const p2y = cy + offset * cos + halfChord * sin;
 
       segments.push({
         points: [{ x: p1x, y: p1y }, { x: p2x, y: p2y }],
@@ -270,9 +212,9 @@ function generateCircleMonotonicInfill(
 }
 
 /**
- * 3D Print First-Layer Monotonic Infill across Rectangle.
+ * Universal Vector Hatch Infill across Rectangle at any angle (0 to 180 deg).
  */
-function generateRectMonotonicInfill(
+function generateRectHatchInfill(
   w: number,
   h: number,
   spacing: number,
@@ -280,18 +222,22 @@ function generateRectMonotonicInfill(
   angleDeg: number = 45
 ): PathSegment[] {
   const segments: PathSegment[] = [];
-  const diag = Math.hypot(w, h);
-  const numLines = Math.ceil(diag / spacing);
+  const cx = w / 2;
+  const cy = h / 2;
+  const radius = Math.hypot(w, h) / 2;
+  const rad = (angleDeg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
 
+  const numLines = Math.ceil((radius * 2) / spacing);
   for (let i = -numLines; i <= numLines; i++) {
     const offset = i * spacing;
-    // 45 degree line: y - x = offset
-    const x1 = 0;
-    const y1 = offset;
-    const x2 = w;
-    const y2 = w + offset;
+    const p1x = cx - offset * sin - radius * cos;
+    const p1y = cy + offset * cos - radius * sin;
+    const p2x = cx - offset * sin + radius * cos;
+    const p2y = cy + offset * cos + radius * sin;
 
-    const clipped = clipLineToBox(x1, y1, x2, y2, 0, 0, w, h);
+    const clipped = clipLineToBox(p1x, p1y, p2x, p2y, 0, 0, w, h);
     if (clipped) {
       segments.push({
         points: [clipped.p1, clipped.p2],

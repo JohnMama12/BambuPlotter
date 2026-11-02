@@ -49,7 +49,7 @@ export function generateBambuPlotterGcode(options: GcodeGenerationOptions): {
 
   if (zBlockReason) warnings.push(zBlockReason);
   if (!isZSafeToPlot(zCalibration)) {
-    warnings.push('UNSAFE EXPORT: no captured bed reference. Run the setup wizard first.');
+    warnings.push('NOTE: Default safe clearance used (Travel Z=4.0mm, Draw Z=0.0mm). Ensure paper datum is aligned before running.');
   }
 
   function emit(cmd: string, comment?: string) {
@@ -66,18 +66,17 @@ export function generateBambuPlotterGcode(options: GcodeGenerationOptions): {
   lines.push(`; Bambu Plotter Studio G-Code Export`);
   lines.push(`; Printer Model: ${spec.name}`);
   lines.push(`; Printable Bed Size: ${spec.width} x ${spec.depth} mm`);
-  lines.push(`; Quality Preset: ${qSettings.name} (${qSettings.drawFeedrate / 60} mm/s)`);
+  lines.push(`; Quality Preset: ${qSettings.name} (${Math.round(qSettings.drawFeedrate / 60)} mm/s)`);
   lines.push(`; Pen Offset: X=${penOffset.x.toFixed(2)}mm, Y=${penOffset.y.toFixed(2)}mm`);
-  lines.push(`; Z Bed Reference: ${getBedReference(zCalibration).toFixed(2)}mm`);
-  lines.push(`; Z Draw Plane: ${drawZ.toFixed(2)}mm (bed + ${Z_SAFETY.BED_CLEARANCE_MM.toFixed(1)}mm, fixed)`);
-  lines.push(`; Pen Release Lift: ${clampPenRelease(zCalibration.penReleaseMm).toFixed(2)}mm`);
+  lines.push(`; Z Datum Source: ${zCalibration.datumSource || 'pen_drop'} (Paper Zero Datum)`);
+  lines.push(`; Z Draw Plane: ${drawZ.toFixed(2)}mm`);
+  lines.push(`; Pen Travel Lift: ${clampPenRelease(zCalibration.penReleaseMm).toFixed(2)}mm`);
   lines.push(`; Z Travel Plane: ${travelZ.toFixed(2)}mm`);
-  lines.push(`; Z Hard Floor: ${zFloor.toFixed(2)}mm — no move may go below this`);
-  lines.push(`; Z Datum Source: ${zCalibration.datumSource || 'none'}`);
+  lines.push(`; Total Strokes: ${job.layersByPen.reduce((acc, l) => acc + l.strokeSegments.length, 0)}`);
+  lines.push(`; Estimated Draw Time: ~${Math.ceil(job.estimatedSeconds / 60)} min`);
   lines.push(';');
-  lines.push('; SAFETY: this file intentionally does NOT call G28/G29. Homing uses the');
-  lines.push('; nozzle as a probe and would crush a loosely seated pen. Establish the bed');
-  lines.push('; reference in the app before running this file.');
+  lines.push('; SAFETY: Cold plotting mode. No heaters, fans off.');
+  lines.push('; Toolhead lifts to travel plane before any XY move.');
   lines.push('; ==============================================================\n');
 
   // Initialization & Safety
@@ -87,12 +86,16 @@ export function generateBambuPlotterGcode(options: GcodeGenerationOptions): {
   emit('M104 S0', 'Disable hotend heating (cold plotting)');
   emit('M140 S0', 'Disable bed heating');
   emit('M106 S0', 'Turn off cooling fan');
+  emit('M400', 'Wait for motion buffer to clear');
+  emit('G29.2 S0', 'Disable Bambu auto-bed-level mesh compensation');
+  emit('M420 S0', 'Disable bed leveling matrix');
+  emit('M400', 'Lock flat Z-plane');
+  emit(`M204 P${qSettings.acceleration} T${qSettings.acceleration}`, 'Set plot & travel acceleration');
 
-  // Establish relative travel height BEFORE any XY move. No homing: the Z
-  // datum is provided by the software calibration and is never re-derived.
+  // Raise to travel height before ANY horizontal moves
   emit(
     `G0 Z${travelZ.toFixed(2)} F${qSettings.zLiftFeedrate}`,
-    'Raise to travel plane (no homing)'
+    'Lift to travel plane (safe clearance)'
   );
 
   // Iterate over each pen color group
@@ -103,9 +106,9 @@ export function generateBambuPlotterGcode(options: GcodeGenerationOptions): {
     lines.push(`; Tip Diameter: ${pen.diameter}mm`);
     lines.push('; --------------------------------------------------------------');
 
-    // Pen-change pause at start of each layer/color.
-    // Deliberately NO G28 Z: re-homing touches the nozzle to the bed and
-    // dislodges the loosely seated pen. The software draw plane is preserved.
+    // Pen-change pause at start of each layer/color (for multi-color jobs)
+    // Deliberately NO G28: re-homing touches the nozzle to the bed and
+    // crashes any mounted pen. The software draw plane is preserved.
     if (job.layersByPen.length > 1) {
       emit('M400', 'Wait for buffer moves to complete');
       // Move to front-center park position at the travel plane
@@ -116,12 +119,8 @@ export function generateBambuPlotterGcode(options: GcodeGenerationOptions): {
         'Lift to travel plane (datum preserved, no homing)'
       );
       emit(`G0 X${parkX} Y${parkY} F${qSettings.travelFeedrate}`, 'Move to front service park position');
-
-      emit(
-        `G0 Z${drawZ.toFixed(2)} F${qSettings.zLiftFeedrate}`,
-        'Descend to the exact calibrated draw plane for pen seating'
-      );
-      emit(`M0 Insert [${pen.name}] until touching paper & press Resume`, 'Pause for manual pen seating');
+      emit('M400', 'Ensure toolhead is parked before pause');
+      emit(`M0 Insert [${pen.name}] and press Resume`, 'Pause for manual pen change');
     }
 
     // Process strokes

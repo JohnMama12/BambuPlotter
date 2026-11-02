@@ -30,6 +30,8 @@ import { TelemetryDrawer } from './components/TelemetryDrawer';
 import { SetupWizardModal } from './components/SetupWizardModal';
 import { ColorSwapModal } from './components/ColorSwapModal';
 import { ConnectionModal } from './components/ConnectionModal';
+import { GcodeExportModal } from './components/GcodeExportModal';
+import { SvgImportModal } from './components/SvgImportModal';
 import { Sliders, Activity } from 'lucide-react';
 
 export default function App() {
@@ -98,7 +100,7 @@ export default function App() {
     {
       id: 'demo-circle-1',
       type: 'circle',
-      name: 'Precision Circle (Monotonic)',
+      name: 'Precision Circle (Hatch)',
       penId: 'pen-blue',
       x: 35,
       y: 40,
@@ -107,14 +109,16 @@ export default function App() {
       radius: 25,
       rotation: 0,
       scale: 1,
-      fillStyle: 'monotonic', // First-layer 3D-printing monotonic sweep
+      fillStyle: 'parallel_hatch',
+      hatchAngle: 45,
+      hatchSpacingMm: 1.0,
       vectorPrecision: 7,
       qualityPreset: 'normal',
     },
     {
       id: 'demo-circle-2',
       type: 'circle',
-      name: 'Concentric Rings',
+      name: 'Concentric Loops',
       penId: 'pen-red',
       x: 95,
       y: 40,
@@ -123,7 +127,7 @@ export default function App() {
       radius: 25,
       rotation: 0,
       scale: 1,
-      fillStyle: 'concentric', // Concentric shrinking circles
+      fillStyle: 'concentric',
       vectorPrecision: 7,
       qualityPreset: 'normal',
     },
@@ -138,8 +142,10 @@ export default function App() {
       height: 35,
       rotation: 0,
       scale: 1,
-      fillStyle: 'monotonic', // Text filled by default like 3D printing first-layer!
-      textContent: 'Bambu A1 Vector Plotter\nFirst-Layer Precision Engine',
+      fillStyle: 'parallel_hatch',
+      hatchAngle: 45,
+      hatchSpacingMm: 0.8,
+      textContent: 'Bambu A1 Vector Plotter\nPrecision Studio Engine',
       fontFamily: 'Arial',
       fontSize: 10,
       isBold: true,
@@ -157,6 +163,8 @@ export default function App() {
   // Modals
   const [isSetupWizardOpen, setIsSetupWizardOpen] = useState<boolean>(false);
   const [isConnectionModalOpen, setIsConnectionModalOpen] = useState<boolean>(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState<boolean>(false);
+  const [svgUploadData, setSvgUploadData] = useState<{ content: string; fileName: string } | null>(null);
 
   // Machine Telemetry & Drawing Stamping
   const [telemetry, setTelemetry] = useState<MachineTelemetry>(() =>
@@ -348,24 +356,11 @@ export default function App() {
       reader.onload = (event) => {
         const content = event.target?.result as string;
         if (content) {
-          const newSvgElem: CanvasElement = {
-            id: `svg-${Date.now()}`,
-            type: 'svg',
-            name: file.name.replace(/\.svg$/i, '') || 'Imported Vector',
-            penId: pens[0]?.id || 'pen-black',
-            x: 40,
-            y: 40,
-            width: 60,
-            height: 60,
-            rotation: 0,
-            scale: 1,
-            fillStyle: 'outline',
-            svgString: content,
-          };
-          handleAddElement(newSvgElem);
+          setSvgUploadData({ content, fileName: file.name });
         }
       };
       reader.readAsText(file);
+      e.target.value = '';
     }
   };
 
@@ -431,9 +426,8 @@ export default function App() {
   // Start Plotting
   const handleStartPlot = () => {
     if (!slicedJob) return;
-    const blockReason = getZBlockReason(zCalibration);
     if (!isZSafeToPlot(zCalibration)) {
-      alert(`SAFETY BLOCK: ${blockReason || 'Z datum is not valid.'}`);
+      setIsSetupWizardOpen(true);
       return;
     }
     setDrawnLines([]);
@@ -445,34 +439,7 @@ export default function App() {
   // Export G-Code
   const handleExportGcode = () => {
     if (!slicedJob) return;
-    const blockReason = getZBlockReason(zCalibration);
-    if (!isZSafeToPlot(zCalibration)) {
-      alert(`SAFETY BLOCK: ${blockReason || 'Z datum is not valid.'}`);
-      return;
-    }
-    const res = generateBambuPlotterGcode({
-      model: printerModel,
-      job: slicedJob,
-      penOffset,
-      zCalibration,
-      quality,
-      paperBounds,
-      syncAllSpeeds,
-    });
-
-    if (res.warnings.length > 0) {
-      console.warn('[G-code export warnings]', res.warnings);
-    }
-
-    const blob = new Blob([res.gcode], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `bambu_plot_${printerModel.toLowerCase()}_${Date.now()}.gcode`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    setIsExportModalOpen(true);
   };
 
   const selectedElement = elements.find((el) => el.id === selectedElementId) || null;
@@ -635,6 +602,36 @@ export default function App() {
           }
         }}
       />
+
+      {/* Production G-Code Export Modal */}
+      <GcodeExportModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        printerModel={printerModel}
+        job={slicedJob}
+        penOffset={penOffset}
+        zCalibration={zCalibration}
+        quality={quality}
+        paperBounds={paperBounds}
+        syncAllSpeeds={syncAllSpeeds}
+      />
+
+      {/* Interactive SVG Import Placement Modal */}
+      {svgUploadData && (
+        <SvgImportModal
+          isOpen={!!svgUploadData}
+          onClose={() => setSvgUploadData(null)}
+          svgContent={svgUploadData.content}
+          fileName={svgUploadData.fileName}
+          pens={pens}
+          paperBounds={paperBounds}
+          printerModel={printerModel}
+          onConfirmImport={(element) => {
+            handleAddElement(element);
+            setSvgUploadData(null);
+          }}
+        />
+      )}
     </div>
   );
 }

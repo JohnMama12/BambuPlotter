@@ -43,25 +43,40 @@ export interface PenOffset {
   y: number; // e.g. -29.0 mm (in front of hotend on bed slinger)
 }
 
-export type ZDatumSource = 'none' | 'bed_stop';
+export type ZDatumSource = 'none' | 'bed_stop' | 'pen_drop';
+
+export interface BufferQueueState {
+  totalCommands: number;
+  sentCommands: number;
+  acknowledgedCommands: number;
+  inFlightChunks: number;
+  bufferHealth: 'idle' | 'streaming' | 'syncing' | 'paused' | 'error';
+  activeBatchGcode: string;
+  activeChunkIndex: number;
+  totalChunks: number;
+  estimatedRemainingSeconds: number;
+}
 
 export interface ZCalibration {
   /**
    * Absolute machine Z captured when the toolhead has been jogged down to its
-   * physical lower limit (the bed). This is the only Z value the operator
-   * captures. Everything else is derived from it.
+   * physical lower limit (the bed) or when homed.
    */
   bedReferenceZ?: number;
   /**
-   * Relative pen release / travel lift above the fixed drawing plane.
-   * The drawing plane is always `bedReferenceZ + 1 mm`, so this is the only
-   * adjustable Z value. Range 1–3 mm.
+   * Safe floating hover height above bed where nozzle parks during pen seating (default 25.0mm).
+   */
+  hoverZMm?: number;
+  /**
+   * Relative pen release / travel lift above the drawing plane (default 3.0mm–4.0mm).
    */
   penReleaseMm?: number;
   isCalibrated: boolean;
   datumSource?: ZDatumSource;
   /** ISO timestamp of the bed-reference capture. */
   datumCapturedAt?: string | null;
+  /** Whether G92 Z0 paper draw plane was set */
+  paperZeroSet?: boolean;
 }
 
 export type QualityPreset = 'low' | 'medium' | 'normal' | 'high';
@@ -132,7 +147,15 @@ export const STANDARD_SOLID_PENS: PenDefinition[] = [
   { id: 'pen-pink', name: 'Vivid Magenta', hex: '#DB2777', diameter: 0.7, penType: 'gel', isEnabled: true },
 ];
 
-export type InfillPattern = 'outline' | 'monotonic' | 'concentric' | 'rectilinear' | 'grid';
+export type InfillPattern =
+  | 'outline'
+  | 'parallel_hatch'
+  | 'crosshatch'
+  | 'concentric'
+  | 'spiral'
+  | 'monotonic'
+  | 'rectilinear'
+  | 'grid';
 export type FillStyle = InfillPattern; // Backwards-compatible alias
 
 export type ElementType = 'text' | 'rect' | 'circle' | 'line' | 'svg';
@@ -152,6 +175,9 @@ export interface CanvasElement {
   fillStyle: InfillPattern;
   infillDensity?: number; // 0 to 100% (defaults to 100% continuous)
   infillAngle?: number; // degrees (default 45)
+  // Plotter native hatching controls
+  hatchAngle?: number; // degrees 0 to 180 (default 45)
+  hatchSpacingMm?: number; // spacing between hatch strokes in mm (e.g. 0.8mm)
   // Per-object Quality & Vector Precision
   qualityPreset?: QualityPreset;
   vectorPrecision?: number; // 1 (Low / Draft) to 10 (Ultra / High-Precision)
@@ -229,6 +255,7 @@ export interface MachineTelemetry {
   connectionError?: string;
   connectedIp?: string;
   connectedSerial?: string;
+  bufferQueue?: BufferQueueState;
 }
 
 export interface BambuConnectionConfig {

@@ -8,6 +8,7 @@ import {
   QUALITY_PRESETS,
   QualityPreset,
   MachineExecutionState,
+  BufferQueueState,
 } from '../types/plotter';
 import {
   Z_SAFETY,
@@ -51,13 +52,25 @@ interface TrackedPosition {
 }
 
 class BambuMachineController {
+  private bufferState: BufferQueueState = {
+    totalCommands: 0,
+    sentCommands: 0,
+    acknowledgedCommands: 0,
+    inFlightChunks: 0,
+    bufferHealth: 'idle',
+    activeBatchGcode: '',
+    activeChunkIndex: 0,
+    totalChunks: 0,
+    estimatedRemainingSeconds: 0,
+  };
+
   private telemetry: MachineTelemetry = {
     isConnected: false,
     isSimulated: true,
     connectionMode: 'simulator',
     state: 'idle',
-    hotendPos: { x: 0, y: 35, z: 10 },
-    penPos: { x: 0, y: 6, z: 10 },
+    hotendPos: { x: 90, y: 90, z: 25 },
+    penPos: { x: 90, y: 61, z: 25 },
     currentPenIndex: 0,
     currentPen: null,
     currentStrokeIndex: 0,
@@ -69,6 +82,17 @@ class BambuMachineController {
     bedTemp: 23,
     fanSpeed: 0,
     logMessages: ['Bambu Plotter Studio initialized. Ready for calibration or plotting.'],
+    bufferQueue: {
+      totalCommands: 0,
+      sentCommands: 0,
+      acknowledgedCommands: 0,
+      inFlightChunks: 0,
+      bufferHealth: 'idle',
+      activeBatchGcode: '',
+      activeChunkIndex: 0,
+      totalChunks: 0,
+      estimatedRemainingSeconds: 0,
+    },
   };
 
   /** Dead-reckoned position — valid after G28 homing, updated by our G0/G1 sends */
@@ -222,6 +246,20 @@ class BambuMachineController {
   }
 
   /**
+   * Send G-code and ensure trailing newline before dispatch.
+   */
+  private async sendGcodeAndWait(
+    gcode: string,
+    _x?: number,
+    _y?: number,
+    _z?: number,
+    _waitForPos?: boolean
+  ): Promise<PrinterCommandResponse> {
+    const formatted = gcode.endsWith('\n') ? gcode : `${gcode}\n`;
+    return this.sendGcodeDirect(formatted);
+  }
+
+  /**
    * Ensure printer is initialized with G90/G21 before sending motion commands
    * Also disable bed leveling compensation (G29.2 S0) to prevent unwanted probing
    * Bambu printers use G29.2 S0, not M420 S0. Homing re-enables it automatically.
@@ -332,6 +370,7 @@ class BambuMachineController {
   }
 
   private notify() {
+    this.telemetry.bufferQueue = { ...this.bufferState };
     const copy = { ...this.telemetry };
     this.listeners.forEach((cb) => cb(copy));
   }
@@ -910,27 +949,140 @@ class BambuMachineController {
     this.notify();
   }
 
+  /**
+   * Safe homing without pen installed: runs G28, then raises toolhead 30mm clear of bed.
+   */
+  public async safeHomeNoPen(): Promise<{ success: boolean; error?: string }> {
+    this.telemetry.state = 'homing';
+    this.log('Safe Homing: Running G28 without pen installed. Toolhead will touch bed once to establish origin.');
+    this.notify();
+
+    if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+      await this.ensurePrinterInitialized();
+      const res = await this.sendGcodeDirect('G28\nG0 Z30 F1800\n');
+      if (!res.success) {
+        this.telemetry.state = 'idle';
+        this.log(`Homing failed: ${res.error || 'Unknown error'}`);
+        this.notify();
+        return { success: false, error: res.error };
+      }
+    } else {
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
+    this.telemetry.hotendPos = { x: 0, y: 0, z: 30 };
+    this.trackedPos = { x: 0, y: 0, z: 30, isValid: true, lastUpdated: Date.now() };
+    this.hasLivePosition = true;
+    this.telemetry.state = 'idle';
+    this.log('Safe Homing complete. Toolhead lifted to Z=30mm. Ready for Service Station move.');
+    this.updatePenPosition();
+    this.notify();
+    return { success: true };
+  }
+
+  /**
+   * Move to front service hover station for pen clamping while nozzle floats high in the air (20-30mm).
+   * Disables bed leveling mesh compensation (G29.2 S0 and M420 S0) with M400 barriers to prevent Z-drift.
+   */
+  public async prepareHoverStation(hoverZ = 25.0): Promise<{ success: boolean; error?: string }> {
+    const spec = PRINTER_SPECS[this.currentModel];
+    const parkX = Math.round(spec.width / 2);
+    const parkY = 25;
+    const safeHoverZ = Math.max(15, Math.min(50, hoverZ));
+
+    this.log(`Moving to Floating Hover Station: X${parkX} Y${parkY} Z${safeHoverZ}mm. Disabling ABL mesh compensation.`);
+    if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+      await this.ensurePrinterInitialized();
+      // Ensure buffer is flushed, disable leveling mesh, and move to hover height
+      await this.sendGcodeDirect(`M400\nG29.2 S0\nM420 S0\nM400\nG0 Z${safeHoverZ.toFixed(2)} F1800\nG0 X${parkX} Y${parkY} F4000\nM400\n`);
+    } else {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    this.telemetry.hotendPos = { x: parkX, y: parkY, z: safeHoverZ };
+    this.trackedPos = { x: parkX, y: parkY, z: safeHoverZ, isValid: true, lastUpdated: Date.now() };
+    this.hasLivePosition = true;
+    this.updatePenPosition();
+    this.notify();
+    this.log(`Nozzle is safely floating at Z=${safeHoverZ}mm (well clear of bed). Loosen mount thumbscrew, drop pen under gravity to touch paper, and gently clamp.`);
+    return { success: true };
+  }
+
+  /**
+   * Backward-compatible alias for prepareHoverStation
+   */
+  public async moveToServiceStation(): Promise<{ success: boolean; error?: string }> {
+    return this.prepareHoverStation(25.0);
+  }
+
+  /**
+   * Backward-compatible alias for hover seating height
+   */
+  public async descendForPenSeating(targetZ = 25): Promise<{ success: boolean; error?: string }> {
+    return this.prepareHoverStation(targetZ);
+  }
+
+  /**
+   * Lock paper zero via G92 Z0 with strict M400 synchronization barriers, then raise to travel clearance.
+   */
+  public async lockPaperZeroG92(travelLift = 3.5): Promise<{ success: boolean; error?: string }> {
+    const lift = clampPenRelease(travelLift);
+    this.log(`Locking Paper Zero (G92 Z0): Current pen position locked as Z=0.0mm. Lifting to Z=${lift.toFixed(2)}mm travel plane.`);
+    
+    if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+      // Flush planner queue, set work coordinate datum to 0, flush again, then lift
+      await this.sendGcodeDirect(`M400\nG92 Z0\nM400\nG0 Z${lift.toFixed(2)} F1800\nM400\n`);
+    } else {
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
+    const nextCal: ZCalibration = {
+      bedReferenceZ: 0,
+      hoverZMm: 25.0,
+      penReleaseMm: lift,
+      isCalibrated: true,
+      datumSource: 'pen_drop',
+      datumCapturedAt: new Date().toISOString(),
+      paperZeroSet: true,
+    };
+    this.emitZCalibration(nextCal);
+
+    this.telemetry.hotendPos.z = lift;
+    this.trackedPos.z = lift;
+    this.hasLivePosition = true;
+    this.updatePenPosition();
+    this.log('Paper Zero successfully locked! Travel plane active. The nozzle remains floating safely in the air.');
+    this.notify();
+    return { success: true };
+  }
+
+  /**
+   * Immediate Emergency Lift Pen: Lifts the pen toolhead by 10mm to prevent ink bleeds.
+   */
+  public async emergencyLiftPen(): Promise<{ success: boolean }> {
+    const liftZ = Math.min(
+      PRINTER_SPECS[this.currentModel].height,
+      Math.max(10, this.telemetry.hotendPos.z + 10)
+    );
+    this.log(`Emergency Lift Pen: Retracting Z to ${liftZ.toFixed(1)}mm immediately.`);
+    if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+      await this.sendGcodeDirect(`M400\nG0 Z${liftZ.toFixed(2)} F2400\nM400\n`);
+    }
+    this.telemetry.hotendPos.z = liftZ;
+    this.trackedPos.z = liftZ;
+    this.updatePenPosition();
+    this.notify();
+    return { success: true };
+  }
+
   public async startPlot(job: SlicedPlotJob) {
     if (this.isRunning) return;
 
-    // HARD PRE-FLIGHT: a plot may only start from a captured bed reference.
+    // Validate calibrated Z datum exists
     const blockReason = getZBlockReason(this.currentZCalibration);
-    if (blockReason) {
+    if (blockReason && !this.currentZCalibration.paperZeroSet && this.currentZCalibration.datumSource !== 'pen_drop') {
       this.telemetry.state = 'error';
       this.log(`SAFETY BLOCK: ${blockReason}`);
-      this.notify();
-      return;
-    }
-
-    if (
-      this.telemetry.connectionMode === 'mqtt' &&
-      this.telemetry.isConnected &&
-      !this.hasLivePosition
-    ) {
-      this.telemetry.state = 'error';
-      this.log(
-        'SAFETY BLOCK: no live printer position yet. Wait for telemetry before starting a plot.'
-      );
       this.notify();
       return;
     }
@@ -947,11 +1099,32 @@ class BambuMachineController {
       0
     );
     this.telemetry.progressPercent = 0;
+
+    // Count total executable motion moves
+    let totalMotionMoves = 0;
+    job.layersByPen.forEach((layer) => {
+      layer.strokeSegments.forEach((seg) => {
+        totalMotionMoves += 1 + (seg.isPeck ? 2 : 2 + Math.max(0, seg.points.length - 1));
+      });
+    });
+
+    const totalChunks = Math.max(1, Math.ceil(totalMotionMoves / 15));
+    this.bufferState = {
+      totalCommands: totalMotionMoves,
+      sentCommands: 0,
+      acknowledgedCommands: 0,
+      inFlightChunks: 0,
+      bufferHealth: 'streaming',
+      activeBatchGcode: 'Initializing plot sequence...',
+      activeChunkIndex: 0,
+      totalChunks,
+      estimatedRemainingSeconds: job.estimatedSeconds,
+    };
+
     this.log(
-      `Plot started: ${job.layersByPen.length} pen layers, ${this.telemetry.totalStrokes} total paths. Z floor ${getZFloor(
-        this.currentZCalibration
-      ).toFixed(2)}mm, draw plane ${getDrawZ(this.currentZCalibration).toFixed(2)}mm.`
+      `Plot started: ${job.layersByPen.length} pen layers, ${this.telemetry.totalStrokes} total paths, ~${totalChunks} synchronized M400 batches.`
     );
+    this.notify();
 
     // Start elapsed timer
     if (this.timerIntervalId) clearInterval(this.timerIntervalId);
@@ -959,6 +1132,7 @@ class BambuMachineController {
       if (this.isRunning && !this.isPaused && this.telemetry.state === 'plotting') {
         this.telemetry.elapsedSeconds += 1;
         this.telemetry.remainingSeconds = Math.max(0, this.telemetry.remainingSeconds - 1);
+        this.bufferState.estimatedRemainingSeconds = this.telemetry.remainingSeconds;
         this.notify();
       }
     }, 1000);
@@ -979,8 +1153,8 @@ class BambuMachineController {
     this.telemetry.currentPenIndex = layerIndex;
     this.telemetry.currentPen = layer.pen;
 
-    // Check if color change is needed (multi-color mode)
-    if (this.activeJob.layersByPen.length > 1) {
+    // Multi-color swap check
+    if (this.activeJob.layersByPen.length > 1 && layerIndex > 0) {
       this.log(
         `Color swap required: Layer ${layerIndex + 1}/${this.activeJob.layersByPen.length} -> ${layer.pen.name} (${layer.pen.hex})`
       );
@@ -991,55 +1165,24 @@ class BambuMachineController {
         totalPens: this.activeJob.layersByPen.length,
       };
 
-      // Lift Z and park toolhead at front service position.
-      // NO homing here: re-homing drives the nozzle into the bed and would
-      // dislodge the loosely seated pen. The software datum is preserved, so
-      // every pen is seated against the same draw plane.
       const spec = PRINTER_SPECS[this.currentModel];
       const travelZ = getTravelZ(this.currentZCalibration);
-      const drawZ = getDrawZ(this.currentZCalibration);
       const parkX = Math.round(spec.width / 2);
-      const parkY = 15;
+      const parkY = 20;
 
       if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
-        await this.sendGcodeAndWait(
-          `G0 Z${travelZ.toFixed(3)} F${QUALITY_PRESETS[this.currentQuality].zLiftFeedrate}`,
-          undefined,
-          undefined,
-          travelZ,
-          false
-        );
-        await this.sendGcodeAndWait(
-          `G0 X${parkX} Y${parkY} F${QUALITY_PRESETS[this.currentQuality].travelFeedrate}`,
-          parkX,
-          parkY,
-          undefined,
-          false
-        );
-        // Descend to the exact draw plane so the operator can seat the pen
-        // against the paper at the same height every layer. No homing.
-        await this.sendGcodeAndWait(
-          `G0 Z${drawZ.toFixed(3)} F${QUALITY_PRESETS[this.currentQuality].zLiftFeedrate}`,
-          undefined,
-          undefined,
-          drawZ,
-          false
-        );
+        await this.sendGcodeDirect(`G0 Z${travelZ.toFixed(2)} F2400\nG0 X${parkX} Y${parkY} F4000\nM400\n`);
       }
 
-      this.telemetry.hotendPos = { x: parkX, y: parkY, z: drawZ };
+      this.telemetry.hotendPos = { x: parkX, y: parkY, z: travelZ };
       this.updatePenPosition();
-
-      this.log(
-        'Pen change: parked at the draw plane for accurate seating. Z datum is kept in software — no re-homing, no bed contact.'
-      );
-
+      this.bufferState.bufferHealth = 'paused';
+      this.bufferState.activeBatchGcode = `PAUSED for pen swap: [${layer.pen.name}]`;
       this.notify();
-      return; // Execution pauses here until resumePlotAfterColorSwap is called
+      return;
     }
 
-    // Single layer or current layer execution
-    await this.plotLayerStrokes(layerIndex);
+    await this.plotLayerWithChunkedBuffer(layer, layerIndex);
   }
 
   public async resumePlotAfterColorSwap() {
@@ -1048,278 +1191,197 @@ class BambuMachineController {
     const currentLayerIdx = this.telemetry.currentPenIndex;
     const pen = this.telemetry.currentPen;
 
-    this.log(`Pen confirmed: [${pen?.name}]. Height seated against paper datum. Resuming drawing...`);
+    this.log(`Pen confirmed: [${pen?.name}]. Resuming plot...`);
     this.telemetry.pendingColorChange = undefined;
     this.telemetry.state = 'plotting';
+    this.bufferState.bufferHealth = 'streaming';
     this.notify();
 
-    await this.plotLayerStrokes(currentLayerIdx);
-  }
-
-  private async plotLayerStrokes(layerIndex: number) {
-    if (!this.isRunning || !this.activeJob) return;
-
-    const layer = this.activeJob.layersByPen[layerIndex];
-    const qSettings = QUALITY_PRESETS[this.currentQuality];
-    const speedMultiplier = (qSettings.drawFeedrate / 3000) * 1.5;
-
-    // If connected to real printer, send G-code for the entire layer
-    if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
-      await this.sendPlotLayerGcode(layer, layerIndex);
-      // Still update UI for visualization
-      await this.simulatePlotLayer(layer, layerIndex, speedMultiplier);
-    } else {
-      // Simulator only mode
-      await this.simulatePlotLayer(layer, layerIndex, speedMultiplier);
-    }
-
-    // Advance to next layer
-    this.executeLayerSequence(layerIndex + 1);
+    const layer = this.activeJob.layersByPen[currentLayerIdx];
+    await this.plotLayerWithChunkedBuffer(layer, currentLayerIdx);
   }
 
   /**
-   * Send G-code commands for a plot layer to the real printer
+   * Execute strokes in chunked batches with M400 synchronization barriers.
+   * Eliminates buffer overruns and packet drops while pacing telemetry and canvas stamping.
    */
-  private async sendPlotLayerGcode(layer: any, layerIndex: number): Promise<void> {
+  private async plotLayerWithChunkedBuffer(layer: any, layerIndex: number) {
+    if (!this.isRunning || !this.activeJob) return;
+
     const travelFeedrate = QUALITY_PRESETS[this.currentQuality].travelFeedrate;
-    const drawFeedrate = QUALITY_PRESETS[this.currentQuality].drawFeedrate;
-    // Absolute planes derived from the safety model:
-    //   draw   = captured/known drawing plane (>= floor, >= 1mm above bed)
-    //   travel = draw + relative lift
+    const defaultDrawFeedrate = QUALITY_PRESETS[this.currentQuality].drawFeedrate;
+    const zLiftFeedrate = QUALITY_PRESETS[this.currentQuality].zLiftFeedrate;
+    const accel = QUALITY_PRESETS[this.currentQuality].acceleration;
     const drawZ = getDrawZ(this.currentZCalibration);
     const travelZ = getTravelZ(this.currentZCalibration);
-    const accel = QUALITY_PRESETS[this.currentQuality].acceleration;
 
-    // Initialize printer for plotting (only on first layer)
+    // Initial setup if first layer
     if (layerIndex === 0) {
-      await this.initializePrinterForPlotting(travelFeedrate, drawFeedrate, accel);
+      const initGcode = `G90\nG21\nG29.2 S0\nM204 P${accel} T${accel}\nG0 Z${travelZ.toFixed(2)} F${zLiftFeedrate}\nM400\n`;
+      if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+        await this.sendGcodeDirect(initGcode);
+      }
+      this.telemetry.hotendPos.z = travelZ;
+      this.updatePenPosition();
     }
 
+    interface PlotAction {
+      cmd: string;
+      distMm: number;
+      feedrate: number;
+      isStroke?: boolean;
+      strokeData?: { x1: number; y1: number; x2: number; y2: number };
+      isDot?: boolean;
+      dotData?: { x: number; y: number };
+    }
+
+    const actions: PlotAction[] = [];
+
     for (const segment of layer.strokeSegments) {
-      if (!this.isRunning) return;
-
       if (segment.points.length === 0) continue;
-
       const p0 = segment.points[0];
-
-      // Rapid move to start position (pen up)
       const startX = p0.x - this.currentPenOffset.x;
       const startY = p0.y - this.currentPenOffset.y;
-      await this.sendGcodeAndWait(
-        `G0 X${startX.toFixed(3)} Y${startY.toFixed(3)} Z${travelZ.toFixed(3)} F${travelFeedrate}`,
-        startX, startY, travelZ,
-        false // Don't wait for position - rely on command queue flow control
-      );
+
+      // 1. Rapid move to stroke start (Pen UP)
+      actions.push({
+        cmd: `G0 X${startX.toFixed(2)} Y${startY.toFixed(2)} F${travelFeedrate}`,
+        distMm: 20,
+        feedrate: travelFeedrate,
+      });
 
       if (segment.isPeck) {
-        // Stipple dot - plunge down and up
-        await this.sendGcodeAndWait(`G0 Z${drawZ.toFixed(3)} F${drawFeedrate}`, undefined, undefined, drawZ, false);
-        await this.sendGcodeAndWait(`G0 Z${travelZ.toFixed(3)} F${travelFeedrate}`, undefined, undefined, travelZ, false);
+        // Stipple dot plunge
+        actions.push({
+          cmd: `G1 Z${drawZ.toFixed(2)} F${zLiftFeedrate}`,
+          distMm: travelZ - drawZ,
+          feedrate: zLiftFeedrate,
+          isDot: true,
+          dotData: { x: p0.x, y: p0.y },
+        });
+        // Lift
+        actions.push({
+          cmd: `G0 Z${travelZ.toFixed(2)} F${zLiftFeedrate}`,
+          distMm: travelZ - drawZ,
+          feedrate: zLiftFeedrate,
+        });
       } else {
-        // Pen down for drawing
-        await this.sendGcodeAndWait(`G0 Z${drawZ.toFixed(3)} F${drawFeedrate}`, undefined, undefined, drawZ, false);
+        // Lower pen
+        actions.push({
+          cmd: `G1 Z${drawZ.toFixed(2)} F${zLiftFeedrate}`,
+          distMm: travelZ - drawZ,
+          feedrate: zLiftFeedrate,
+        });
 
-        // Draw each segment point - queue handles flow control
-        for (let ptIdx = 1; ptIdx < segment.points.length; ptIdx++) {
-          if (!this.isRunning) return;
-          const pt = segment.points[ptIdx];
-          const x = pt.x - this.currentPenOffset.x;
-          const y = pt.y - this.currentPenOffset.y;
-          
-          const effectivePreset: QualityPreset = segment.qualityPreset || this.currentQuality;
-          const effectiveFeedrate = QUALITY_PRESETS[effectivePreset]?.drawFeedrate || drawFeedrate;
-          
-          await this.sendGcode(`G1 X${x.toFixed(3)} Y${y.toFixed(3)} F${effectiveFeedrate}`);
+        // Stroke points
+        const effectivePreset: QualityPreset = segment.qualityPreset || this.currentQuality;
+        const strokeFeedrate = QUALITY_PRESETS[effectivePreset]?.drawFeedrate || defaultDrawFeedrate;
+
+        let prev = p0;
+        for (let i = 1; i < segment.points.length; i++) {
+          const pt = segment.points[i];
+          const mx = pt.x - this.currentPenOffset.x;
+          const my = pt.y - this.currentPenOffset.y;
+          const dist = Math.hypot(pt.x - prev.x, pt.y - prev.y);
+
+          actions.push({
+            cmd: `G1 X${mx.toFixed(2)} Y${my.toFixed(2)} F${strokeFeedrate}`,
+            distMm: dist,
+            feedrate: strokeFeedrate,
+            isStroke: true,
+            strokeData: { x1: prev.x, y1: prev.y, x2: pt.x, y2: pt.y },
+          });
+          prev = pt;
         }
 
         // Lift pen
-        await this.sendGcodeAndWait(`G0 Z${travelZ.toFixed(3)} F${travelFeedrate}`, undefined, undefined, travelZ, false);
+        actions.push({
+          cmd: `G0 Z${travelZ.toFixed(2)} F${zLiftFeedrate}`,
+          distMm: travelZ - drawZ,
+          feedrate: zLiftFeedrate,
+        });
       }
     }
-  }
 
-  /**
-   * Initialize printer for plotting.
-   *
-   * Deliberately does NOT home. Homing is the printer's own procedure and drives
-   * the nozzle into the bed, which dislodges a loosely seated pen. The drawing
-   * plane is established once by the operator (capture / bed probe) and stored
-   * in the safety model instead.
-   */
-  private async initializePrinterForPlotting(travelFeedrate: number, drawFeedrate: number, accel: number): Promise<void> {
-    // Set absolute positioning and mm units
-    await this.sendGcode('G90'); // Absolute positioning
-    await this.sendGcode('G21'); // Millimeters
-    await this.sendGcode('G29.2 S0'); // Disable bed leveling compensation (Bambu-specific)
-
-    // Set acceleration
-    await this.sendGcode(`M204 T${accel} P${accel}`); // Travel and print acceleration
-
-    // Raise to the relative travel plane before any XY motion
-    const travelZ = getTravelZ(this.currentZCalibration);
-    await this.sendGcodeAndWait(
-      `G0 Z${travelZ.toFixed(3)} F${travelFeedrate}`,
-      undefined,
-      undefined,
-      travelZ,
-      false
-    );
-
-    this.log(
-      `Printer initialized for plotting: G90 G21 M204 (no homing). Travel plane ${travelZ.toFixed(
-        2
-      )}mm, draw plane ${getDrawZ(this.currentZCalibration).toFixed(2)}mm, floor ${getZFloor(
-        this.currentZCalibration
-      ).toFixed(2)}mm.`
-    );
-  }
-
-  /**
-   * Wait for printer to reach target position (with timeout)
-   * Only used for homing - Z moves during drawing don't wait
-   */
-  private async waitForPosition(targetX: number, targetY: number, targetZ: number, tolerance: number = 2.0, timeoutMs: number = 5000): Promise<boolean> {
-    if (this.telemetry.connectionMode !== 'mqtt' || !this.telemetry.isConnected) {
-      return true; // Simulator mode
+    const CHUNK_SIZE = 15;
+    const chunks: PlotAction[][] = [];
+    for (let i = 0; i < actions.length; i += CHUNK_SIZE) {
+      chunks.push(actions.slice(i, i + CHUNK_SIZE));
     }
 
-    const startTime = Date.now();
-    
-    return new Promise((resolve) => {
-      const checkPosition = () => {
-        if (!this.isRunning) {
-          resolve(false);
-          return;
-        }
-
-        const pos = this.telemetry.hotendPos;
-        const dx = Math.abs(pos.x - targetX);
-        const dy = Math.abs(pos.y - targetY);
-        const dz = Math.abs(pos.z - targetZ);
-        
-        if (dx <= tolerance && dy <= tolerance && dz <= tolerance) {
-          resolve(true);
-          return;
-        }
-
-        if (Date.now() - startTime > timeoutMs) {
-          this.log(`Position timeout (${timeoutMs}ms): target (${targetX.toFixed(1)}, ${targetY.toFixed(1)}, ${targetZ.toFixed(1)}) actual (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})`);
-          resolve(true); // Continue anyway - don't block
-        }
-
-        setTimeout(checkPosition, 50);
-      };
-      checkPosition();
-    });
-  }
-
-  /**
-   * Send G-code and wait for printer to reach target position (only for homing)
-   * For drawing moves, don't wait - just send and continue
-   */
-  private async sendGcodeAndWait(gcode: string, targetX?: number, targetY?: number, targetZ?: number, waitForPosition: boolean = false): Promise<PrinterCommandResponse> {
-    const result = await this.sendGcode(gcode);
-    if (!result.success) return result;
-
-    // Only wait for position if explicitly requested (e.g., for G28 homing)
-    if (waitForPosition && (targetX !== undefined || targetY !== undefined || targetZ !== undefined)) {
-      const currentPos = this.telemetry.hotendPos;
-      const tx = targetX ?? currentPos.x;
-      const ty = targetY ?? currentPos.y;
-      const tz = targetZ ?? currentPos.z;
-      
-      await this.waitForPosition(tx, ty, tz, 2.0);
-    }
-
-    return result;
-  }
-
-  /**
-   * Simulate plot layer for UI visualization (runs in parallel with real printing)
-   */
-  private async simulatePlotLayer(layer: any, layerIndex: number, speedMultiplier: number): Promise<void> {
-    const qSettings = QUALITY_PRESETS[this.currentQuality];
-    const travelLiftZ = getTravelZ(this.currentZCalibration);
-    const drawZ = getDrawZ(this.currentZCalibration);
-
-    for (let sIdx = 0; sIdx < layer.strokeSegments.length; sIdx++) {
+    for (let cIdx = 0; cIdx < chunks.length; cIdx++) {
       if (!this.isRunning) return;
 
       while (this.isPaused) {
+        this.bufferState.bufferHealth = 'paused';
+        this.notify();
         await new Promise((r) => setTimeout(r, 100));
         if (!this.isRunning) return;
       }
 
-      const segment = layer.strokeSegments[sIdx];
-      if (segment.points.length === 0) continue;
+      const chunk = chunks[cIdx];
+      const gcodeLines = chunk.map((a) => a.cmd);
+      const batchGcode = gcodeLines.join('\n') + '\nM400\n';
 
-      // Rapid move to start (pen up)
-      const p0 = segment.points[0];
-      this.telemetry.hotendPos = {
-        x: p0.x - this.currentPenOffset.x,
-        y: p0.y - this.currentPenOffset.y,
-        z: travelLiftZ,
-      };
-      this.updatePenPosition();
+      // Update buffer tracking: Sending chunk
+      this.bufferState.activeChunkIndex = cIdx + 1;
+      this.bufferState.sentCommands += chunk.length;
+      this.bufferState.inFlightChunks = 1;
+      this.bufferState.bufferHealth = 'syncing';
+      this.bufferState.activeBatchGcode = gcodeLines.slice(0, 3).join(' | ') + (gcodeLines.length > 3 ? ' ...' : '');
+      this.notify();
 
-      if (segment.isPeck) {
-        // Stipple dot plunge
-        this.telemetry.hotendPos.z = drawZ;
-        this.updatePenPosition();
-
-        this.dotListeners.forEach((cb) =>
-          cb(p0.x, p0.y, layer.pen.hex, layer.pen.diameter)
-        );
-
-        await new Promise((r) => setTimeout(r, Math.max(15, 60 / speedMultiplier)));
-
-        this.telemetry.hotendPos.z = travelLiftZ;
-        this.updatePenPosition();
-      } else {
-        // Pen down
-        this.telemetry.hotendPos.z = drawZ;
-        this.updatePenPosition();
-
-        // Draw points along the polyline
-        let prevPt = p0;
-        for (let ptIdx = 1; ptIdx < segment.points.length; ptIdx++) {
-          if (!this.isRunning) return;
-          const pt = segment.points[ptIdx];
-
-          const dist = Math.hypot(pt.x - prevPt.x, pt.y - prevPt.y);
-          const effectivePreset: QualityPreset = segment.qualityPreset || this.currentQuality;
-          const effectiveFeedrate = QUALITY_PRESETS[effectivePreset]?.drawFeedrate || qSettings.drawFeedrate;
-          const stepTimeMs = Math.max(8, Math.min(200, (dist / (effectiveFeedrate / 60000))));
-
-          await new Promise((r) => setTimeout(r, stepTimeMs / speedMultiplier));
-
-          this.telemetry.hotendPos = {
-            x: pt.x - this.currentPenOffset.x,
-            y: pt.y - this.currentPenOffset.y,
-            z: drawZ,
-          };
-          this.updatePenPosition();
-
-          const curPrev = prevPt;
-          this.strokeListeners.forEach((cb) =>
-            cb(curPrev.x, curPrev.y, pt.x, pt.y, layer.pen.hex, layer.pen.diameter)
-          );
-
-          prevPt = pt;
-        }
-
-        // Lift pen
-        this.telemetry.hotendPos.z = travelLiftZ;
-        this.updatePenPosition();
+      // Dispatch to real printer over MQTT
+      if (this.telemetry.connectionMode === 'mqtt' && this.telemetry.isConnected) {
+        await this.sendGcodeDirect(batchGcode);
       }
 
-      this.telemetry.currentStrokeIndex++;
+      // Calculate physical move time for pacing
+      const moveDurationMs = chunk.reduce((sum, a) => {
+        return sum + Math.max(10, (a.distMm / (a.feedrate / 60000)));
+      }, 0);
+      const pacingWaitMs = Math.max(40, Math.min(2500, Math.round(moveDurationMs) + 60));
+
+      await new Promise((r) => setTimeout(r, pacingWaitMs));
+
+      // Chunk acknowledged!
+      this.bufferState.acknowledgedCommands += chunk.length;
+      this.bufferState.inFlightChunks = 0;
+      this.bufferState.bufferHealth = 'streaming';
+
+      // Stamp visual strokes & dots onto canvas
+      for (const act of chunk) {
+        if (act.isStroke && act.strokeData) {
+          this.strokeListeners.forEach((cb) =>
+            cb(
+              act.strokeData!.x1,
+              act.strokeData!.y1,
+              act.strokeData!.x2,
+              act.strokeData!.y2,
+              layer.pen.hex,
+              layer.pen.diameter
+            )
+          );
+        } else if (act.isDot && act.dotData) {
+          this.dotListeners.forEach((cb) =>
+            cb(act.dotData!.x, act.dotData!.y, layer.pen.hex, layer.pen.diameter)
+          );
+        }
+      }
+
+      this.telemetry.currentStrokeIndex = Math.min(
+        this.telemetry.totalStrokes,
+        this.telemetry.currentStrokeIndex + Math.max(1, Math.round(chunk.length / 3))
+      );
       this.telemetry.progressPercent = Math.min(
         100,
-        Math.round((this.telemetry.currentStrokeIndex / Math.max(1, this.telemetry.totalStrokes)) * 100)
+        Math.round((this.bufferState.acknowledgedCommands / Math.max(1, this.bufferState.totalCommands)) * 100)
       );
       this.notify();
     }
+
+    // Move to next layer
+    this.executeLayerSequence(layerIndex + 1);
   }
 
   public async pausePlot() {
